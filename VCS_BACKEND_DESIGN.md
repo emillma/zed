@@ -147,49 +147,77 @@ the backend is jj. It is a mechanical rename (trait + the two impls + the
 `LocalRepositoryState` field + downstream casts) done **before** adding jj, with zero
 behavior change.
 
-The pragmatic shape: a **core `VcsRepository` trait** carrying the small backend-agnostic
-surface that the status bar and status scan need, with the full git method set exposed
-through a **`GitRepository: VcsRepository` extension trait** (so git keeps its 68 methods
-unchanged) — or, alternatively, keep all methods on the core trait with default
-`Err(Unsupported)` bodies and have jj override only the core. The extension-trait split is
-preferred here because 60+ git-specific methods are genuinely inapplicable to jj; making
-jj "implement" 60 no-op methods is noise and a false signal that jj supports them.
+The resolved shape (post-draft review — decision 1): a **core supertrait
+`VcsRepository`** carrying only the methods the project's status scan + status bar
+paths actually consume (from the verified `git_store.rs` call sites — target ≤15:
+head/state sha, branch/bookmark info, status/diff hunks, show/merge message, repo
+detection), with `GitRepository` remaining the existing 68-method trait. Its
+`VcsRepository` supertrait bound is satisfied by a **blanket delegation impl** —
+`impl<T: GitRepository + ?Sized> VcsRepository for T` — that fully-qualifies each
+core method to the corresponding `GitRepository` method. Git therefore has **zero
+behavior change and no duplicated bodies** (no 60 no-op bodies), and jj implements
+`VcsRepository` only.
 
 ```rust
-/// Minimal backend-agnostic core: the project's status scan + status bar consume this.
+/// Backend-agnostic core: the methods the project's status scan + status bar
+/// paths actually consume (target ≤15, finalized by auditing `git_store.rs`).
 pub trait VcsRepository: Send + Sync {
-    /// `Some("git")` / `Some("jj")` — drives UI (e.g. which icon/label to render).
+    /// "git" | "jj" — drives the UI (icon/label, status-item content).
     fn backend_id(&self) -> &'static str;
 
-    /// HEAD-equivalent: commit id, jj change id, and the bookmark/branch name.
-    fn head(&self) -> BoxFuture<'_, Result<VcsHead>>;
+    // Head / state sha (git_store.rs:2355)
+    fn head_sha(&self) -> BoxFuture<'_, Option<String>>;
 
-    /// Working-tree change state (the Slice A core of `status`).
-    fn status(&self) -> BoxFuture<'_, Result<VcsStatus>>;
+    // Branch/bookmark info (git_store.rs:8604); jj fills these with bookmarks.
+    fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>>;
 
-    /// A unified, backend-agnostic "what changed" view (Slice A also wants this for the
-    /// status bar's changed-file count; the richer hunk view is Slice B).
-    fn diff(&self) -> BoxFuture<'_, Result<String>>;
+    // Status / diff hunks (status scan; gutter indicators arrive in slice B)
+    fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>>;
+    fn diff(&self, diff: DiffType) -> BoxFuture<'_, Result<String>>;
+    fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>>;
+
+    // Commit view / message (git_store.rs:6394, 7157)
+    fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>>;
+    fn merge_message(&self) -> BoxFuture<'_, Option<String>>;
+
+    // Repo detection / paths
+    fn path(&self) -> PathBuf;
+    fn main_repository_path(&self) -> PathBuf;
+    fn commit_data_reader(&self) -> Result<CommitDataReader>;
+    fn default_branch(&self, include_remote_name: bool)
+    -> BoxFuture<'_, Result<Option<SharedString>>>;
+    fn check_access(&self) -> BoxFuture<'_, Result<()>>;
+
+    // blame / richer hunk APIs land in later slices as needed; target total ≤15.
 }
 
-pub struct VcsHead {
-    pub commit_id: String,            // git SHA / jj commit id
-    pub change_id: Option<String>,    // jj only (short change id)
-    pub bookmark: Option<String>,     // jj bookmark / git HEAD branch name
-}
-
-pub struct VcsStatus {
-    pub entries: Arc<[(VcsPath, VcsFileStatus)]>,
-}
-// VcsPath wraps a relative path; VcsFileStatus is a backend-agnostic subset of the
-// existing git `FileStatus` (added/modified/deleted/untracked; jj has no staged/unstaged
-// split — it reports only working-copy-vs-commit).
-
-/// Git-specific surface. `RealGitRepository` implements BOTH; jj implements only the core.
+/// Existing git surface: all 68 methods, unchanged — no new bodies. The
+/// `VcsRepository` supertrait bound is satisfied by the blanket impl below.
 pub trait GitRepository: VcsRepository {
-    // … the existing 68 methods, unchanged (Oid/RepoPath/branches/stash/push/blame/…).
+    // … the existing 68 methods, unchanged (Oid/RepoPath/index/branches/stash/push/blame/…) …
+}
+
+/// Any git backend is also a `VcsRepository`: each core method fully-qualifies to
+/// the corresponding git method. Zero behavior change, no duplicate bodies, and
+/// no "unsupported" no-ops anywhere.
+impl<T: GitRepository + ?Sized> VcsRepository for T {
+    fn backend_id(&self) -> &'static str { "git" }
+    fn head_sha(&self) -> BoxFuture<'_, Option<String>> {
+        GitRepository::head_sha(self).boxed()
+    }
+    fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>> {
+        GitRepository::status(self, path_prefixes)
+    }
+    // … each remaining core method forwards via `GitRepository::method(self)` …
 }
 ```
+
+For slice A the core trait reuses the existing git-crate data types (`GitStatus`,
+`BranchesScanResult`, `TreeDiff`, `CommitDetails`) unchanged — they are plain data
+(paths + status codes; refs with an `is_head` flag) that jj fills naturally
+(bookmark → `ref_name`, no `upstream`). Generalizing them into backend-neutral
+names is follow-up work, not slice A's job.
+
 
 The seam becomes `LocalRepositoryState { backend: Arc<dyn VcsRepository>, … }`
 (`git_store.rs:750`). Git-specific operations (branch picker, push/pull, stash) downcast
@@ -209,24 +237,25 @@ via `backend.as_any().downcast_ref::<dyn GitRepository>()` (or a small enum
 - **diff**: `jj diff --config ui.paginate=never` (text) / a unified template for hunks.
 
 **Detection & colocation.** At repository discovery (where `git_store` currently keys off
-`dot_git_abs_path`, `git_store.rs:127/6094`), look in the worktree root for `.jj` **first**,
-then `.git`:
-- `.jj` present → `JjRepository` backend.
-- `.jj` absent, `.git` present → `RealGitRepository` backend (unchanged).
-- **Colocated** (both `.git` and `.jj`) → **jj backend wins for status display**: jj owns
-  the working-copy state in colocated mode, and showing git's status would be
-  double-reporting / stale. Git-only operations remain reachable via the downcast (a user
-  can still `git log`, etc.). **Open question:** whether the backend choice in the
-  colocated case should be user-configurable (see Risks).
+`dot_git_abs_path`, `git_store.rs:127/6094`), look in the worktree root for `.jj` and
+`.git`:
+- `.jj` only → `JjRepository` backend.
+- `.git` only → `RealGitRepository` backend (unchanged).
+- **Colocated** (both `.git` and `.jj`) → **both backends run** (resolved decision 3):
+  the GitPanel keeps showing git state, and the new status-bar item shows jj state —
+  no precedence conflict, no user setting for now (flagged for the upstream discussion).
+  Git-only operations remain reachable via the downcast (a user can still `git log`, etc.).
 
 ## Slice plan
 
 - **A — trait + status bar (this design's target).** Introduce `VcsRepository`/
-  `GitRepository` and move git behind it with zero behavior change; instantiate the right
-  backend from `.jj`/`.git` detection; add a status-bar item that shows jj bookmark +
-  change id (jj workspaces and colocated repos) while leaving git's existing display
-  untouched. What the backend must expose: `backend_id`, `head`, `status` (changed-file
-  state), and the status-scan hook so `schedule_scan` drives jj polls.
+  `GitRepository` with the blanket delegation (resolved decision 1) and move git behind
+  it with zero behavior change; instantiate the right backend from `.jj`/`.git`
+  detection; add the new status-bar item driven by the active backend — git repos show
+  the branch name, jj repos (colocated or `.jj`-only) show `<bookmark> @ <change-id>` —
+  while the GitPanel keeps its current git-only behavior (resolved decision 2). What the
+  backend must expose: the core `VcsRepository` methods (head/branch-bookmark, status,
+  diff) plus the status-scan hook so `schedule_scan` drives jj polls.
 - **B — diff indicators + blame.** The rich hunk-level diff for gutter indicators and the
   blame view. What the backend must expose: a structured diff (hunks with line ranges) and
   per-line blame. jj maps via `jj diff` (hunks) and `jj log -p`-style per-line attribution
@@ -242,35 +271,52 @@ then `.git`:
   the VCS trait — the conflict data flows through the language server, not the repository
   seam.
 
+## Resolved decisions (post-draft review)
+
+The draft's open questions are resolved as follows (design review, 2026-09-21):
+
+1. **Trait mechanism = split + blanket delegation.** Introduce a core supertrait
+   `VcsRepository` containing only the methods the project/status paths actually consume
+   (from the verified call sites in `git_store.rs` — target ≤15 methods: head/state sha,
+   branch/bookmark info, status/diff hunks, show/merge message, repo detection).
+   `GitRepository: VcsRepository` becomes a supertrait, satisfied by a blanket impl
+   `impl<T: GitRepository + ?Sized> VcsRepository for T` that fully-qualifies delegation
+   to the `GitRepository` methods — zero behavior change, no 60 no-op bodies. jj then
+   implements `VcsRepository` only. (The trait sketch above is updated accordingly.)
+2. **Status bar = new item, git panel untouched.** Main has no status-bar branch item
+   (verified: `zed.rs:636-651`). Slice A adds a new status-bar item driven by the active
+   backend: git repos → branch name (consistent with the panel); jj repos (colocated or
+   `.jj`-only) → `<bookmark> @ <change-id>`. The GitPanel keeps its current git-only
+   behavior.
+3. **Colocation precedence.** When both `.git` and `.jj` exist, BOTH backends run —
+   the git panel keeps showing git state, the new status item shows jj state. No user
+   setting for now; flagged as an upstream-discussion topic.
+4. **jj availability.** Locate `jj` on `PATH`, mirroring the `GitBinary` pattern
+   (`repository.rs:3863`). Missing binary → jj backend disabled silently; git behavior
+   unaffected.
+5. **Snapshot side effects.** Read-only polls run with `jj --ignore-working-copy` so
+   status polling never mutates the working copy; an explicit refresh/user action may
+   snapshot. Tradeoff: status then reflects the last-snapshotted state rather than the
+   live buffer.
+6. **Performance.** Debounce/coalesce status polls; one templated jj invocation per
+   refresh (e.g. a single `jj log`/`jj status` with a template carrying bookmark +
+   change id); minimum-interval throttle. Concrete numbers deferred to T5.
+
 ## Risks and open questions
 
-- **The trait is git-shaped, not a small seam.** `GitRepository` has 68 methods and its
-  signatures carry `Oid`/`RepoPath`, staging/index, branches, refs, remotes — most of which
-  have no jj analogue. **Open question:** keep the full surface on the core `VcsRepository`
-  with default "unsupported" bodies, or split into `VcsRepository` (core) + `GitRepository`
-  (extension)? The sketch assumes the split; either way git must be refactored behind the
-  seam **first** with zero behavior change, and jj overrides only the core.
-- **jj snapshot side effects from Zed's file watchers.** jj commits a working-copy change
-  (a new snapshot) as a side effect of many commands, and jj's own file watcher does the
-  same. Zed's `schedule_scan` polls status on worktree events. **Risk:** the editor's
-  status polls and jj's watcher both mutate the working copy, so "what the user has
-  unsaved changes in" can drift under jj. We must only run **benign** read-only commands
-  from a poll, and understand that "HEAD" for jj means the working-copy change (which
-  advances on every edit). **Open question:** should we disable jj's file watcher while
-  Zed holds the repo, and how to snapshot on Zed's own save?
-- **Colocation double-reporting.** With both `.git` and `.jj`, a naive impl would show
-  git status *and* jj status for the same files. Decision: jj wins for status display;
-  git-only operations still available via downcast. **Open question:** should the backend
-  choice in the colocated case be a user setting (e.g. "prefer git" / "prefer jj"), or is
-  jj-always-correct the right call?
-- **Performance of CLI spawns per status poll.** Each jj invocation is a process spawn.
-  Zed's scan loop can fire often (on every worktree event burst). **Open question:** how to
-  throttle/coalesce jj polls (debounce, a minimum interval, or a single templated command
-  that returns head + status + diff in one spawn) so we don't hammer the CLI.
-- **jj availability.** Does the user have `jj` on `PATH`, and at a version new enough for
-  the templates we use? **Open question:** does Zed ship/bundle jj, or require a
-  pre-installed binary (mirroring how Zed locates the `git` binary)?
-- **Status bar item.** Current `main` has **no** status-bar branch item (the branch shows
-  in the GitPanel/branch picker). Slice A adds a *new* item for jj. **Open question:** is
-  the intended UX a dedicated jj status-bar item, or should the jj state be folded into the
-  existing `git_blame_status`/panel so the UI stays uniform across backends?
+The draft's first, third, fifth, and sixth questions (trait shape, colocation, jj
+availability, status-bar UX) are resolved in "Resolved decisions (post-draft review)"
+above and are struck here. Remaining:
+
+- **Safe commands under `--ignore-working-copy`.** Polling runs jj with
+  `--ignore-working-copy` (resolved decision 5), so polling no longer mutates the working
+  copy. **Open question:** which jj commands remain safe/correct under
+  `--ignore-working-copy`, and which need a real snapshot (and thus are limited to
+  explicit refresh/user actions)?
+- **Concrete throttle numbers.** Polls are debounced/coalesced with a minimum interval,
+  and each refresh is one templated jj invocation (resolved decision 6). **Open
+  question:** the concrete throttle numbers (minimum interval, max in-flight polls) —
+  deferred to T5.
+- **Core trait coverage.** Does the core ≤15-method set (resolved decision 1) cover
+  everything the `Repository` entity in `git_store.rs` needs for its scan/branch-refresh
+  plumbing, or does some plumbing stay git-specific in slice A?
