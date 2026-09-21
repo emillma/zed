@@ -5,12 +5,14 @@ mod remote;
 pub mod repository;
 pub mod stash;
 pub mod status;
+pub mod vcs;
 
 pub use crate::hosting_provider::*;
 pub use crate::remote::*;
 use anyhow::Result;
 use gpui::{Action, actions};
 pub use repository::RemoteCommandOutput;
+pub use crate::vcs::VcsRepository;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Write as _};

@@ -1,4 +1,4 @@
-use git::repository::DiffType;
+use git::repository::{DiffType, GitRepository};
 use gpui::{App, Entity, Task};
 use serde::{Deserialize, Serialize};
 use worktree::Worktree;
@@ -90,8 +90,10 @@ impl TelemetryWorktreeSnapshot {
                             };
 
                             let remote_url = backend.remote_url("origin").await;
-                            let head_sha = backend.head_sha().await;
-                            let diff = backend.diff(DiffType::HeadToWorktree).await.ok();
+                            let head_sha = GitRepository::head_sha(&*backend).await;
+                            let diff = GitRepository::diff(&*backend, DiffType::HeadToWorktree)
+                                .await
+                                .ok();
 
                             GitState {
                                 remote_url,

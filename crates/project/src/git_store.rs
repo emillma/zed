@@ -2352,7 +2352,9 @@ impl GitStore {
                             .await
                             .with_context(|| format!("remote \"{remote}\" not found"))?;
 
-                        let sha = backend.head_sha().await.context("reading HEAD SHA")?;
+                        let sha = GitRepository::head_sha(&*backend)
+                            .await
+                            .context("reading HEAD SHA")?;
 
                         let provider_registry =
                             cx.update(GitHostingProviderRegistry::default_global);
@@ -6391,7 +6393,9 @@ impl MergeDetails {
         current_conflicted_paths: Vec<RepoPath>,
     ) -> bool {
         log::debug!("load merge details");
-        self.message = backend.merge_message().await.map(SharedString::from);
+        self.message = GitRepository::merge_message(&**backend)
+            .await
+            .map(SharedString::from);
         let heads = backend
             .revparse_batch(vec![
                 "MERGE_HEAD".into(),
@@ -7154,7 +7158,7 @@ impl Repository {
         self.send_job("show", None, move |git_repo, _cx| async move {
             match git_repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.show(commit).await
+                    GitRepository::show(&*backend, commit).await
                 }
                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                     let resp = client
@@ -7702,7 +7706,7 @@ impl Repository {
             }
         }
 
-        let reader = match backend.commit_data_reader() {
+        let reader = match GitRepository::commit_data_reader(&*backend) {
             Ok(reader) => reader,
             Err(error) => {
                 log::error!("failed to create commit data reader: {error:?}");
@@ -8601,7 +8605,7 @@ impl Repository {
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
-        let branches_scan = backend.branches().await?;
+        let branches_scan = GitRepository::branches(&*backend).await?;
         let branch_list_error = branches_scan.error;
         let branch_list: Arc<[Branch]> = branches_scan.branches.into();
         let branch = branch_list.iter().find(|branch| branch.is_head).cloned();
@@ -9099,7 +9103,7 @@ impl Repository {
         self.send_job("branches", None, move |repo, _| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.branches().await
+                    GitRepository::branches(&*backend).await
                 }
                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                     let response = client
@@ -9313,7 +9317,7 @@ impl Repository {
         self.send_job("head_sha", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    Ok(backend.head_sha().await)
+                    Ok(GitRepository::head_sha(&*backend).await)
                 }
                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                     let response = client
@@ -9571,7 +9575,7 @@ impl Repository {
         self.send_job("default_branch", None, move |repo, _| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.default_branch(include_remote_name).await
+                    GitRepository::default_branch(&*backend, include_remote_name).await
                 }
                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                     let response = client
@@ -9597,7 +9601,7 @@ impl Repository {
         self.send_job("diff_tree", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.diff_tree(diff_type).await
+                    GitRepository::diff_tree(&*backend, diff_type).await
                 }
                 RepositoryState::Remote(RemoteRepositoryState { client, project_id }) => {
                     let (is_merge, includes_worktree, base, head) = match diff_type {
@@ -9663,7 +9667,7 @@ impl Repository {
         self.send_job("diff", None, move |repo, _cx| async move {
             match repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.diff(diff_type).await
+                    GitRepository::diff(&*backend, diff_type).await
                 }
                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                     let (proto_diff_type, merge_base_ref) = match &diff_type {
@@ -10447,7 +10451,7 @@ impl Repository {
                         );
                         let changed_paths_vec = changed_paths.iter().cloned().collect::<Vec<_>>();
 
-                        let status_task = backend.status(&changed_paths_vec);
+                        let status_task = GitRepository::status(&*backend, &changed_paths_vec);
                         let diff_stat_future = |diff| {
                             if has_head {
                                 backend.diff_stat(diff, &changed_paths_vec)
@@ -10637,10 +10641,12 @@ impl Repository {
                 // directory. For now we just return `GitAccess::Yes` so that
                 // remoting continues working as expected.
                 RepositoryState::Remote(..) => GitAccess::Yes,
-                RepositoryState::Local(state) => match state.backend.check_access().await {
-                    Ok(_) => GitAccess::Yes,
-                    Err(_) => GitAccess::No,
-                },
+                RepositoryState::Local(state) => {
+                    match GitRepository::check_access(&*state.backend).await {
+                        Ok(_) => GitAccess::Yes,
+                        Err(_) => GitAccess::No,
+                    }
+                }
             }
         })
     }
@@ -12313,11 +12319,20 @@ async fn compute_snapshot(
 
     let branches_future = {
         let backend = backend.clone();
-        async move { backend.branches().await.log_err().unwrap_or_default() }
+        async move {
+            GitRepository::branches(&*backend)
+                .await
+                .log_err()
+                .unwrap_or_default()
+        }
     };
     let head_commit_future = {
         let backend = backend.clone();
-        async move { backend.show("HEAD".to_string()).await.ok() }
+        async move {
+            GitRepository::show(&*backend, "HEAD".to_string())
+                .await
+                .ok()
+        }
     };
     let worktrees_future = {
         let backend = backend.clone();
@@ -12384,13 +12399,15 @@ async fn compute_snapshot(
     let statuses_future = {
         let backend = backend.clone();
         async move {
-            backend
-                .status(&[RepoPath::from_rel_path(
+            GitRepository::status(
+                &*backend,
+                &[RepoPath::from_rel_path(
                     &RelPath::new(".".as_ref(), PathStyle::local()).unwrap(),
-                )])
-                .await
-                .log_err()
-                .unwrap_or_default()
+                )],
+            )
+            .await
+            .log_err()
+            .unwrap_or_default()
         }
     };
     let diff_stats_future = {

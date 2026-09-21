@@ -779,7 +779,7 @@ pub fn delete_branch_flag(is_remote_tracking_ref: bool, force: bool) -> &'static
     }
 }
 
-pub trait GitRepository: Send + Sync {
+pub trait GitRepository: crate::vcs::VcsRepository {
     /// Returns the contents of an entry in the repository's index, or None if there is no entry for the given path.
     ///
     /// Also returns `None` for symlinks.
