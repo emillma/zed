@@ -2868,7 +2868,62 @@ impl GitStore {
         }
         if changed {
             cx.emit(GitStoreEvent::JjRepositoriesUpdated);
+            cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| {
+                    this.reload_jj_buffer_diff_bases(cx)
+                })
+                .ok();
+            })
+            .detach();
         }
+    }
+
+    fn reload_jj_buffer_diff_bases(&mut self, cx: &mut Context<Self>) {
+        let buffer_diff_base_changes = self
+            .diffs
+            .iter()
+            .filter_map(|(buffer_id, _diff_state)| {
+                let buffer = self.buffer_store.read(cx).get(*buffer_id)?;
+                let (backend, repo_path) =
+                    self.jj_repository_and_path_for_buffer_id(*buffer_id, cx)?;
+                log::debug!(
+                    "start reload jj diff bases for repo path {}",
+                    repo_path.as_unix_str()
+                );
+                Some((buffer, backend, repo_path))
+            })
+            .collect::<Vec<_>>();
+
+        cx.spawn(async move |this, cx| {
+            let mut base_texts = Vec::new();
+            for (buffer, backend, repo_path) in buffer_diff_base_changes {
+                let base_text = backend
+                    .load_base_text(&repo_path)
+                    .await
+                    .log_err()
+                    .flatten();
+                base_texts.push((buffer, base_text));
+            }
+
+            this.update(cx, |this, cx| {
+                for (buffer, base_text) in base_texts {
+                    let buffer_snapshot = buffer.read(cx).text_snapshot();
+                    let buffer_id = buffer_snapshot.remote_id();
+                    let Some(diff_state) = this.diffs.get(&buffer_id) else {
+                        continue;
+                    };
+                    diff_state.update(cx, |diff_state, cx| {
+                        diff_state.diff_bases_changed(
+                            buffer_snapshot,
+                            Some(DiffBasesChange::SetBoth(base_text)),
+                            cx,
+                        );
+                    });
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn new_jj_backend(
