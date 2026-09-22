@@ -131,7 +131,9 @@ impl JjBinary {
         S: AsRef<OsStr>,
     {
         let mut command = new_command(&self.jj_binary_path);
-        command.args(["--no-pager", "--no-progress"]);
+        // jj (0.45) has no --no-progress flag; progress is only rendered on a TTY,
+        // and Zed captures stdout through a pipe, so --no-pager alone suffices.
+        command.args(["--no-pager"]);
         if read_only {
             command.arg("--ignore-working-copy");
         }
