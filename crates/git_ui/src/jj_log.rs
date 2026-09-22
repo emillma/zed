@@ -302,8 +302,13 @@ impl Render for JjLog {
                         .collect()
                 },
                             )
-                            .h(ROW_HEIGHT * item_count as f32)
-                            .overflow_hidden(),
+                            // Explicit content height: the list's internal
+                            // scroll range becomes zero (it never scrolls),
+                            // so the shared container scrolls both children.
+                            // Do NOT use .overflow_hidden() here — it skips
+                            // uniform_list's scroll-offset initialization
+                            // and panics in prepaint.
+                            .h(ROW_HEIGHT * item_count as f32),
                     ),
             )
     }
