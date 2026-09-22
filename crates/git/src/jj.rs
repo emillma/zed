@@ -191,6 +191,39 @@ impl JjRepository {
             .spawn(async move { jj.run_read_only(&args).await })
             .boxed()
     }
+
+    /// Returns the most recent `limit` revisions, newest first, as log
+    /// entries for the history panel.
+    pub fn log(&self, limit: usize) -> BoxFuture<'_, Result<Vec<JjLogEntry>>> {
+        let jj = self.jj_binary.clone();
+        let limit = limit.to_string();
+        self.executor
+            .spawn(async move {
+                let output = jj
+                    .run_read_only(&[
+                        "log",
+                        "-n",
+                        limit.as_str(),
+                        "--no-graph",
+                        "-T",
+                        LOG_TEMPLATE,
+                    ])
+                    .await?;
+                Ok(parse_log_output(&output))
+            })
+            .boxed()
+    }
+}
+
+/// A single `jj log` revision, for the history panel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JjLogEntry {
+    pub change_id: SharedString,
+    pub commit_id: SharedString,
+    pub bookmarks: Vec<SharedString>,
+    pub description: SharedString,
+    pub author_name: SharedString,
+    pub commit_timestamp: i64,
 }
 
 /// Maps the outcome of `jj file show -r @- <path>` for `load_base_text`:
@@ -392,6 +425,10 @@ impl VcsRepository for JjRepository {
 /// separator would misparse.
 const SHOW_TEMPLATE: &str = "commit_id ++ \"|JJSEP|\" ++ description ++ \"|JJSEP|\" ++ committer.timestamp().format(\"%s\") ++ \"|JJSEP|\" ++ author.name() ++ \"|JJSEP|\" ++ author.email()";
 
+/// `jj log` template: one row per revision, `|JJSEP|`-separated fields,
+/// each row terminated by `"\n"` (without it, rows concatenate).
+const LOG_TEMPLATE: &str = "change_id.short() ++ \"|JJSEP|\" ++ commit_id ++ \"|JJSEP|\" ++ bookmarks.join(\",\") ++ \"|JJSEP|\" ++ description.first_line() ++ \"|JJSEP|\" ++ author.name() ++ \"|JJSEP|\" ++ committer.timestamp().format(\"%s\") ++ \"\\n\"";
+
 /// Parses `show` template output (sha, description, committer epoch, author name,
 /// author email) into CommitDetails.
 fn parse_show_output(output: &str) -> Result<CommitDetails> {
@@ -407,6 +444,34 @@ fn parse_show_output(output: &str) -> Result<CommitDetails> {
         author_name: fields[3].trim().into(),
         author_email: fields[4].trim().into(),
     })
+}
+
+/// Parses `jj log` template output into log entries, skipping empty or
+/// malformed rows.
+fn parse_log_output(output: &str) -> Vec<JjLogEntry> {
+    const SEP: &str = "|JJSEP|";
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(SEP).collect();
+            if fields.len() < 6 {
+                return None;
+            }
+            Some(JjLogEntry {
+                change_id: fields[0].trim().into(),
+                commit_id: fields[1].trim().into(),
+                bookmarks: fields[2]
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|bookmark| !bookmark.is_empty())
+                    .map(SharedString::from)
+                    .collect(),
+                description: fields[3].trim_end().into(),
+                author_name: fields[4].trim().into(),
+                commit_timestamp: fields[5].trim().parse::<i64>().unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 /// Parses `jj bookmark list` output into branches. A bookmark line
@@ -675,6 +740,43 @@ mod tests {
         assert_eq!(details.message.as_str(), "line one\nline two");
         assert_eq!(details.commit_timestamp, 1790059323);
     }
+    #[test]
+    fn test_parse_log_output_multi_row() {
+        const OUTPUT: &str = concat!(
+            "abc123def456|JJSEP|0123456789abcdef0123456789abcdef|JJSEP|main*,feature|JJSEP|fix the thing|JJSEP|Emil Martens|JJSEP|1790059323\n",
+            "789fedcba654|JJSEP|9876543210fedc9876543210fedc9876|JJSEP||JJSEP||JJSEP|Ana Torres|JJSEP|1790059000\n"
+        );
+        let entries = parse_log_output(OUTPUT);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].change_id, SharedString::from("abc123def456"));
+        assert_eq!(entries[0].commit_id, SharedString::from("0123456789abcdef0123456789abcdef"));
+        assert_eq!(
+            entries[0].bookmarks,
+            vec![SharedString::from("main*"), SharedString::from("feature")]
+        );
+        assert_eq!(entries[0].description, SharedString::from("fix the thing"));
+        assert_eq!(entries[0].author_name, SharedString::from("Emil Martens"));
+        assert_eq!(entries[0].commit_timestamp, 1790059323);
+        assert!(entries[1].bookmarks.is_empty());
+        assert_eq!(entries[1].description, SharedString::from(""));
+        assert_eq!(entries[1].commit_timestamp, 1790059000);
+    }
+
+    #[test]
+    fn test_parse_log_output_single_row() {
+        let entries = parse_log_output(
+            "abc123def456|JJSEP|0123|JJSEP|main*|JJSEP|hello|JJSEP|Bob|JJSEP|123",
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].bookmarks, vec![SharedString::from("main*")]);
+        assert_eq!(entries[0].commit_timestamp, 123);
+    }
+
+    #[test]
+    fn test_parse_log_output_empty() {
+        assert!(parse_log_output("").is_empty());
+    }
+
     #[test]
     fn test_map_base_text_present() {
         let result = map_base_text(Ok("base contents".to_string()));
