@@ -1,8 +1,16 @@
-use gpui::{uniform_list, Context, Entity, Render, Subscription, Window};
+use anyhow::Result;
 use git::jj::JjLogEntry;
+use gpui::{
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Subscription,
+    Task, WeakEntity, Window, actions, uniform_list,
+};
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
 use std::time::{Duration, Instant};
 use ui::prelude::*;
+use workspace::{
+    SerializableItem, Workspace,
+    item::{Item, ItemEvent},
+};
 
 /// Minimum time between polls of the jj log for the history panel.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -12,10 +20,8 @@ const LOG_LIMIT: usize = 200;
 
 /// The jj history panel: a list of the first 200 changes of the first
 /// jj repository in the project, if any.
-///
-/// Registration and actions come later; this entity only holds and
-/// renders the entries (and the loading, error, and empty states).
 pub struct JjLog {
+    focus_handle: FocusHandle,
     git_store: Entity<GitStore>,
     entries: Vec<JjLogEntry>,
     loading: bool,
@@ -29,6 +35,7 @@ impl JjLog {
     pub fn new(git_store: Entity<GitStore>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&git_store, Self::on_git_store_event);
         let mut this = Self {
+            focus_handle: cx.focus_handle(),
             git_store,
             entries: Vec::new(),
             loading: false,
@@ -108,11 +115,7 @@ impl JjLog {
 }
 
 impl Render for JjLog {
-    fn render(
-        &mut self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let entries = self.entries.clone();
         if let Some(error) = self.error.as_deref() {
             return v_flex()
@@ -137,77 +140,153 @@ impl Render for JjLog {
             .flex_1()
             .size_full()
             .overflow_hidden()
-            .child(
-                uniform_list(
-                    "jj_log_list",
-                    item_count,
-                    move |range, _window, _cx| {
-                            entries[range.clone()]
+            .child(uniform_list(
+                "jj_log_list",
+                item_count,
+                move |range, _window, _cx| {
+                    entries[range.clone()]
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, entry)| {
+                            let index = range.start + ix;
+                            let change_id = entry.change_id.to_string();
+                            let short_change_id = change_id[..change_id.len().min(8)].to_string();
+                            let bookmarks = entry
+                                .bookmarks
                                 .iter()
-                                .enumerate()
-                                .map(|(ix, entry)| {
-                                    let index = range.start + ix;
-                                    let change_id = entry.change_id.to_string();
-                                    let short_change_id =
-                                        change_id[..change_id.len().min(8)].to_string();
-                                    let bookmarks = entry
-                                        .bookmarks
-                                        .iter()
-                                        .map(|bookmark| bookmark.to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    let description = entry
-                                        .description
-                                        .lines()
-                                        .next()
-                                        .unwrap_or("");
-                                    let author = entry.author_name.to_string();
-                                    let timestamp = entry.commit_timestamp.to_string();
-                                    v_flex()
-                                        .id(("jj-log-item", index))
-                                        .w_full()
-                                        .py_1()
-                                        .px_2()
-                                        .gap_0p5()
-                                        .child(
-                                            h_flex()
-                                                .gap_1()
-                                                .child(
-                                                    Label::new(
-                                                        short_change_id.as_str(),
-                                                    )
-                                                )
-                                                .when(
-                                                    !bookmarks.is_empty(),
-                                                    |this| {
-                                                        this.child(
-                                                            Label::new(
-                                                                bookmarks.as_str(),
-                                                            )
-                                                            .color(Color::Muted),
-                                                        )
-                                                    },
-                                                ),
-                                        )
-                                        .child(
-                                            Label::new(description).color(Color::Muted),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .gap_1()
-                                                .child(
-                                                    Label::new(author.as_str())
-                                                        .color(Color::Muted),
-                                                )
-                                                .child(
-                                                    Label::new(timestamp.as_str())
-                                                        .color(Color::Muted),
-                                                ),
-                                        )
-                                })
-                                .collect()
-                    },
-                ),
-            )
+                                .map(|bookmark| bookmark.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let description = entry.description.lines().next().unwrap_or("");
+                            let author = entry.author_name.to_string();
+                            let timestamp = entry.commit_timestamp.to_string();
+                            v_flex()
+                                .id(("jj-log-item", index))
+                                .w_full()
+                                .py_1()
+                                .px_2()
+                                .gap_0p5()
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(Label::new(short_change_id.as_str()))
+                                        .when(!bookmarks.is_empty(), |this| {
+                                            this.child(
+                                                Label::new(bookmarks.as_str()).color(Color::Muted),
+                                            )
+                                        }),
+                                )
+                                .child(Label::new(description).color(Color::Muted))
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(Label::new(author.as_str()).color(Color::Muted))
+                                        .child(Label::new(timestamp.as_str()).color(Color::Muted)),
+                                )
+                        })
+                        .collect()
+                },
+            ))
+    }
+}
+
+actions!(
+    jj_log,
+    [
+        /// Opens the JJ log panel.
+        OpenJjLog,
+    ]
+);
+
+/// Registers the JJ log panel and its open action.
+pub fn init(cx: &mut App) {
+    workspace::register_serializable_item::<JjLog>(cx);
+
+    cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
+        workspace.register_action_renderer(|div, workspace, _, _| {
+            let workspace = workspace.weak_handle();
+
+            div.on_action(move |_: &OpenJjLog, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        let git_store = workspace.project().read(cx).git_store().clone();
+                        open_jj_log(workspace, git_store, window, cx);
+                    })
+                    .ok();
+            })
+        });
+    })
+    .detach();
+}
+
+/// Opens the JJ log panel, reusing the one already open if present.
+pub fn open_jj_log(
+    workspace: &mut Workspace,
+    git_store: Entity<GitStore>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let existing = workspace.items_of_type::<JjLog>(cx).next();
+    if let Some(existing) = existing {
+        workspace.activate_item(&existing, true, true, window, cx);
+    } else {
+        let jj_log = cx.new(|cx| JjLog::new(git_store, cx));
+        workspace.add_item_to_active_pane(Box::new(jj_log.clone()), None, true, window, cx);
+    }
+}
+impl Focusable for JjLog {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<ItemEvent> for JjLog {}
+
+impl Item for JjLog {
+    type Event = ItemEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "JJ Log".into()
+    }
+}
+
+impl SerializableItem for JjLog {
+    fn serialized_item_kind() -> &'static str {
+        "JjLog"
+    }
+
+    fn cleanup(
+        _: workspace::WorkspaceId,
+        _: Vec<workspace::ItemId>,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
+    fn deserialize(
+        project: Entity<project::Project>,
+        _workspace: WeakEntity<Workspace>,
+        _: workspace::WorkspaceId,
+        _: workspace::ItemId,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        let git_store = project.read(cx).git_store().clone();
+        Task::ready(Ok(cx.new(|cx| JjLog::new(git_store, cx))))
+    }
+
+    fn serialize(
+        &mut self,
+        _: &mut Workspace,
+        _: workspace::ItemId,
+        _: bool,
+        _: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        Some(Task::ready(Ok(())))
+    }
+
+    fn should_serialize(&self, _: &Self::Event) -> bool {
+        false
     }
 }
