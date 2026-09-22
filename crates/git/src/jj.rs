@@ -220,6 +220,7 @@ impl JjRepository {
 pub struct JjLogEntry {
     pub change_id: SharedString,
     pub commit_id: SharedString,
+    pub parents: Vec<SharedString>,
     pub bookmarks: Vec<SharedString>,
     pub description: SharedString,
     pub author_name: SharedString,
@@ -427,7 +428,7 @@ const SHOW_TEMPLATE: &str = "commit_id ++ \"|JJSEP|\" ++ description ++ \"|JJSEP
 
 /// `jj log` template: one row per revision, `|JJSEP|`-separated fields,
 /// each row terminated by `"\n"` (without it, rows concatenate).
-const LOG_TEMPLATE: &str = "change_id.short() ++ \"|JJSEP|\" ++ commit_id ++ \"|JJSEP|\" ++ bookmarks.join(\",\") ++ \"|JJSEP|\" ++ description.first_line() ++ \"|JJSEP|\" ++ author.name() ++ \"|JJSEP|\" ++ committer.timestamp().format(\"%s\") ++ \"\\n\"";
+const LOG_TEMPLATE: &str = "change_id.short() ++ \"|JJSEP|\" ++ commit_id ++ \"|JJSEP|\" ++ parents.map(|p| p.commit_id()).join(\" \") ++ \"|JJSEP|\" ++ bookmarks.join(\",\") ++ \"|JJSEP|\" ++ description.first_line() ++ \"|JJSEP|\" ++ author.name() ++ \"|JJSEP|\" ++ committer.timestamp().format(\"%s\") ++ \"\\n\"";
 
 /// Parses `show` template output (sha, description, committer epoch, author name,
 /// author email) into CommitDetails.
@@ -454,21 +455,27 @@ fn parse_log_output(output: &str) -> Vec<JjLogEntry> {
         .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split(SEP).collect();
-            if fields.len() < 6 {
+            if fields.len() < 7 {
                 return None;
             }
             Some(JjLogEntry {
                 change_id: fields[0].trim().into(),
                 commit_id: fields[1].trim().into(),
-                bookmarks: fields[2]
+                parents: fields[2]
+                    .split(' ')
+                    .map(str::trim)
+                    .filter(|parent| !parent.is_empty())
+                    .map(SharedString::from)
+                    .collect(),
+                bookmarks: fields[3]
                     .split(',')
                     .map(str::trim)
                     .filter(|bookmark| !bookmark.is_empty())
                     .map(SharedString::from)
                     .collect(),
-                description: fields[3].trim_end().into(),
-                author_name: fields[4].trim().into(),
-                commit_timestamp: fields[5].trim().parse::<i64>().unwrap_or(0),
+                description: fields[4].trim_end().into(),
+                author_name: fields[5].trim().into(),
+                commit_timestamp: fields[6].trim().parse::<i64>().unwrap_or(0),
             })
         })
         .collect()
@@ -743,13 +750,21 @@ mod tests {
     #[test]
     fn test_parse_log_output_multi_row() {
         const OUTPUT: &str = concat!(
-            "abc123def456|JJSEP|0123456789abcdef0123456789abcdef|JJSEP|main*,feature|JJSEP|fix the thing|JJSEP|Emil Martens|JJSEP|1790059323\n",
-            "789fedcba654|JJSEP|9876543210fedc9876543210fedc9876|JJSEP||JJSEP||JJSEP|Ana Torres|JJSEP|1790059000\n"
+            "abc123def456|JJSEP|0123456789abcdef0123456789abcdef|JJSEP|1111111111111111111111111111111111111111 2222222222222222222222222222222222222222|JJSEP|main*,feature|JJSEP|fix the thing|JJSEP|Emil Martens|JJSEP|1790059323\n",
+            "789fedcba654|JJSEP|9876543210fedc9876543210fedc9876|JJSEP||JJSEP||JJSEP||JJSEP|Ana Torres|JJSEP|1790059000\n"
         );
         let entries = parse_log_output(OUTPUT);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].change_id, SharedString::from("abc123def456"));
         assert_eq!(entries[0].commit_id, SharedString::from("0123456789abcdef0123456789abcdef"));
+        assert_eq!(
+            entries[0].parents,
+            vec![
+                SharedString::from("1111111111111111111111111111111111111111"),
+                SharedString::from("2222222222222222222222222222222222222222"),
+            ]
+        );
+        assert!(entries[1].parents.is_empty());
         assert_eq!(
             entries[0].bookmarks,
             vec![SharedString::from("main*"), SharedString::from("feature")]
@@ -765,9 +780,13 @@ mod tests {
     #[test]
     fn test_parse_log_output_single_row() {
         let entries = parse_log_output(
-            "abc123def456|JJSEP|0123|JJSEP|main*|JJSEP|hello|JJSEP|Bob|JJSEP|123",
+            "abc123def456|JJSEP|0123|JJSEP|3333333333333333333333333333333333333333|JJSEP|main*|JJSEP|hello|JJSEP|Bob|JJSEP|123",
         );
         assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].parents,
+            vec![SharedString::from("3333333333333333333333333333333333333333")]
+        );
         assert_eq!(entries[0].bookmarks, vec![SharedString::from("main*")]);
         assert_eq!(entries[0].commit_timestamp, 123);
     }
