@@ -1402,7 +1402,8 @@ impl GitPanel {
                     GitStoreEvent::RepositoryUpdated(_, _, _) => {}
                     GitStoreEvent::JobsUpdated
                     | GitStoreEvent::ConflictsUpdated
-                    | GitStoreEvent::DiffBaseChanged(_) => {}
+                    | GitStoreEvent::DiffBaseChanged(_)
+                    | GitStoreEvent::JjRepositoriesUpdated => {}
                 },
             )
             .detach();

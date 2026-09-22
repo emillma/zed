@@ -34,6 +34,7 @@ use futures::{
 use git::{
     BuildPermalinkParams, GitHostingProviderRegistry, Oid, RunHook,
     blame::Blame,
+    jj::JjRepository,
     parse_git_remote_url,
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
@@ -71,7 +72,7 @@ use smallvec::SmallVec;
 use smol::future::yield_now;
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque, hash_map::Entry},
     future::Future,
     mem,
     ops::Range,
@@ -94,7 +95,8 @@ use util::{
 };
 use worktree::{
     File, PathChange, PathKey, PathProgress, PathSummary, PathTarget, ProjectEntryId,
-    UpdatedGitRepositoriesSet, UpdatedGitRepository, Worktree, WorktreeSettings,
+    UpdatedGitRepositoriesSet, UpdatedGitRepository, UpdatedJjRepositoriesSet,
+    UpdatedJjRepository, Worktree, WorktreeSettings,
 };
 use zeroize::Zeroize;
 
@@ -104,6 +106,7 @@ pub struct GitStore {
     buffer_store: Entity<BufferStore>,
     worktree_store: Entity<WorktreeStore>,
     repositories: HashMap<RepositoryId, Entity<Repository>>,
+    jj_repositories: BTreeMap<ProjectEntryId, JjRepositoryState>,
     parked_repositories: Vec<ParkedRepository>,
     diff_base: GitDiffBaseSetting,
     display_diffs: HashMap<RepositoryId, DisplayDiff>,
@@ -127,6 +130,15 @@ pub struct ParkedRepository {
     dot_git_abs_path: Arc<Path>,
     repository_dir_abs_path: Arc<Path>,
     common_dir_abs_path: Arc<Path>,
+}
+
+pub struct JjRepositoryState {
+    // The key is mirrored in the map key; kept so state entries stand alone.
+    #[allow(dead_code)]
+    work_directory_id: ProjectEntryId,
+    abs_path: Arc<Path>,
+    jj_dir_path: Arc<Path>,
+    backend: Option<Arc<JjRepository>>,
 }
 
 impl ParkedRepository {
@@ -856,6 +868,7 @@ pub enum GitStoreEvent {
     ConflictsUpdated,
     GlobalConfigurationUpdated,
     DiffBaseChanged(Option<RepositoryId>),
+    JjRepositoriesUpdated,
 }
 
 impl EventEmitter<RepositoryEvent> for Repository {}
@@ -1011,6 +1024,7 @@ impl GitStore {
             buffer_store,
             worktree_store,
             repositories: HashMap::default(),
+            jj_repositories: BTreeMap::default(),
             parked_repositories: Vec::new(),
             diff_base: diff_base_setting,
             display_diffs: HashMap::default(),
@@ -1022,6 +1036,10 @@ impl GitStore {
             diffs: HashMap::default(),
             buffer_ids_by_index_text_buffer_id: HashMap::default(),
         }
+    }
+
+    pub fn jj_repositories(&self) -> &BTreeMap<ProjectEntryId, JjRepositoryState> {
+        &self.jj_repositories
     }
 
     pub(crate) fn set_project(&mut self, project: WeakEntity<Project>) {
@@ -2468,7 +2486,9 @@ impl GitStore {
                     .detach();
                 }
             }
-            WorktreeStoreEvent::WorktreeUpdatedJjRepositories(_, _) => {}
+            WorktreeStoreEvent::WorktreeUpdatedJjRepositories(worktree_id, changed_repos) => {
+                self.update_jj_repositories_from_worktree(*worktree_id, changed_repos.clone(), cx);
+            }
             WorktreeStoreEvent::WorktreeUpdatedGitRepositories(worktree_id, changed_repos) => {
                 let Some(worktree) = worktree_store.read(cx).worktree_for_id(*worktree_id, cx)
                 else {
@@ -2730,6 +2750,106 @@ impl GitStore {
                     .ok();
             }
         }
+    }
+
+    /// Update our list of jj repositories in response to a notification from a worktree.
+    fn update_jj_repositories_from_worktree(
+        &mut self,
+        worktree_id: WorktreeId,
+        updated_jj_repositories: UpdatedJjRepositoriesSet,
+        cx: &mut Context<Self>,
+    ) {
+        let is_trusted = TrustedWorktrees::try_get_global(cx)
+            .map(|trusted_worktrees| {
+                trusted_worktrees.update(cx, |trusted_worktrees, cx| {
+                    trusted_worktrees.can_trust(&self.worktree_store, worktree_id, cx)
+                })
+            })
+            .unwrap_or(false);
+
+        let mut changed = false;
+        for update in updated_jj_repositories.iter() {
+            let UpdatedJjRepository {
+                work_directory_id,
+                new_work_directory_abs_path,
+                dot_jj_abs_path,
+                ..
+            } = update;
+            match (new_work_directory_abs_path, dot_jj_abs_path) {
+                (Some(work_directory_abs_path), Some(jj_dir_path)) => {
+                    let work_directory_abs_path = work_directory_abs_path.clone();
+                    let jj_dir_path = jj_dir_path.clone();
+                    if let Some(existing) = self.jj_repositories.get_mut(work_directory_id) {
+                        if existing.abs_path == work_directory_abs_path
+                            && existing.jj_dir_path == jj_dir_path
+                        {
+                            continue;
+                        }
+                        // The repository moved: point the backend at the new paths.
+                        existing.abs_path = work_directory_abs_path;
+                        existing.jj_dir_path = jj_dir_path;
+                        existing.backend = Self::new_jj_backend(
+                            &existing.abs_path,
+                            &existing.jj_dir_path,
+                            is_trusted,
+                            cx,
+                        );
+                        changed = true;
+                    } else {
+                        let backend = Self::new_jj_backend(
+                            &work_directory_abs_path,
+                            &jj_dir_path,
+                            is_trusted,
+                            cx,
+                        );
+                        self.jj_repositories.insert(
+                            *work_directory_id,
+                            JjRepositoryState {
+                                work_directory_id: *work_directory_id,
+                                abs_path: work_directory_abs_path,
+                                jj_dir_path,
+                                backend,
+                            },
+                        );
+                        changed = true;
+                    }
+                }
+                (None, _) => {
+                    if self.jj_repositories.remove(work_directory_id).is_some() {
+                        changed = true;
+                    }
+                }
+                (_, _) => {}
+            }
+        }
+        if changed {
+            cx.emit(GitStoreEvent::JjRepositoriesUpdated);
+        }
+    }
+
+    fn new_jj_backend(
+        work_directory_abs_path: &Arc<Path>,
+        jj_dir_path: &Arc<Path>,
+        is_trusted: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<JjRepository>> {
+        let jj_binary_path = which::which_in(
+            "jj",
+            std::env::var_os("PATH").as_deref(),
+            work_directory_abs_path,
+        )
+        .ok()
+        .or_else(|| which::which("jj").ok());
+        // `jj` not found on PATH: the repository is tracked without a backend.
+        jj_binary_path.map(|jj_binary_path| {
+            Arc::new(JjRepository::new(
+                jj_binary_path,
+                work_directory_abs_path.to_path_buf(),
+                jj_dir_path.to_path_buf(),
+                cx.background_executor().clone(),
+                is_trusted,
+            ))
+        })
     }
 
     fn retarget_parked_repositories(&mut self, update: &UpdatedGitRepository) {
