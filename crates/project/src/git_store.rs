@@ -32,7 +32,7 @@ use futures::{
     stream::{FuturesOrdered, FuturesUnordered},
 };
 use git::{
-    BuildPermalinkParams, GitHostingProviderRegistry, Oid, RunHook,
+    BuildPermalinkParams, GitHostingProviderRegistry, Oid, RunHook, VcsRepository,
     blame::Blame,
     jj::JjRepository,
     parse_git_remote_url,
@@ -1833,7 +1833,45 @@ impl GitStore {
         let Some((repo, repo_path)) =
             self.repository_and_path_for_buffer_id(buffer.read(cx).remote_id(), cx)
         else {
-            return Task::ready(Err(anyhow!("failed to find git repository for buffer")));
+            let Some((jj_backend, jj_repo_path)) =
+                self.jj_repository_and_path_for_buffer_id(buffer_id, cx)
+            else {
+                return Task::ready(Err(anyhow!("failed to find git repository for buffer")));
+            };
+
+            let is_symlink = Self::buffer_is_symlink(&buffer, cx);
+            let task = self
+                .loading_diffs
+                .entry((buffer_id, DiffKind::Uncommitted))
+                .or_insert_with(|| {
+                    let changes = if is_symlink {
+                        Task::ready(Ok(DiffBasesChange::SetBoth(None)))
+                    } else {
+                        cx.background_executor().spawn(async move {
+                            jj_backend
+                                .load_base_text(&jj_repo_path)
+                                .await
+                                .map(DiffBasesChange::SetBoth)
+                        })
+                    };
+
+                    // todo(lw): hot foreground spawn
+                    cx.spawn(async move |this, cx| {
+                        Self::open_diff_internal(
+                            this,
+                            DiffKind::Uncommitted,
+                            changes.await,
+                            buffer,
+                            cx,
+                        )
+                        .await
+                        .map_err(Arc::new)
+                    })
+                    .shared()
+                })
+                .clone();
+
+            return cx.background_spawn(async move { task.await.map_err(|e| anyhow!("{e}")) });
         };
 
         let is_symlink = Self::buffer_is_symlink(&buffer, cx);
@@ -3396,6 +3434,27 @@ impl GitStore {
                 Some((repo.clone(), repo_path))
             })
             .max_by_key(|(repo, _)| repo.read(cx).work_directory_abs_path.clone())
+    }
+
+    fn jj_repository_and_path_for_buffer_id(
+        &self,
+        buffer_id: BufferId,
+        cx: &App,
+    ) -> Option<(Arc<JjRepository>, RepoPath)> {
+        let buffer = self.buffer_store.read(cx).get(buffer_id)?;
+        let project_path = buffer.read(cx).project_path(cx)?;
+        let abs_path = self.worktree_store.read(cx).absolutize(&project_path, cx)?;
+        let state = self
+            .jj_repositories
+            .values()
+            .filter(|state| abs_path.starts_with(&state.abs_path))
+            .max_by_key(|state| state.abs_path.clone())?;
+        let rel_path = self
+            .worktree_store
+            .read(cx)
+            .path_style()
+            .strip_prefix(&abs_path, &state.abs_path)?;
+        Some((state.backend()?.clone(), RepoPath::from_rel_path(&rel_path)))
     }
 
     pub fn git_init(
