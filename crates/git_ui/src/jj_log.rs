@@ -1,10 +1,13 @@
 use anyhow::Result;
-use git::jj::JjLogEntry;
+use crate::git_graph::{GraphData, accent_colors_count};
+use git::{jj::JjLogEntry, repository::InitialGraphCommitData, Oid};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Subscription,
     Task, WeakEntity, Window, actions, uniform_list,
 };
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ui::prelude::*;
 use workspace::{
@@ -24,6 +27,8 @@ pub struct JjLog {
     focus_handle: FocusHandle,
     git_store: Entity<GitStore>,
     entries: Vec<JjLogEntry>,
+    #[allow(dead_code)] // Consumed by upcoming graph lane rendering.
+    graph_data: Option<GraphData>,
     loading: bool,
     error: Option<String>,
     poll_scheduled: bool,
@@ -38,6 +43,7 @@ impl JjLog {
             focus_handle: cx.focus_handle(),
             git_store,
             entries: Vec::new(),
+            graph_data: None,
             loading: false,
             error: None,
             poll_scheduled: false,
@@ -103,7 +109,34 @@ impl JjLog {
                 if repository.is_some() {
                     this.last_poll = Some(Instant::now());
                 }
+                // Lane data is only built on a successful fetch; jj log
+                // entries arrive children-first, the order add_commits expects.
+                let graph_data = error
+                    .as_ref()
+                    .is_none()
+                    .then(|| {
+                        let commits: Vec<Arc<InitialGraphCommitData>> = entries
+                            .iter()
+                            .filter_map(|entry| {
+                                let sha = Oid::from_str(&entry.commit_id).ok()?;
+                                Some(Arc::new(InitialGraphCommitData {
+                                    sha,
+                                    parents: entry
+                                        .parents
+                                        .iter()
+                                        .filter_map(|parent| Oid::from_str(parent).ok())
+                                        .collect(),
+                                    ref_names: entry.bookmarks.clone(),
+                                }))
+                            })
+                            .collect();
+                        let mut graph_data =
+                            GraphData::new(accent_colors_count(&cx.theme().accents()));
+                        graph_data.add_commits(&commits);
+                        graph_data
+                    });
                 this.entries = entries;
+                this.graph_data = graph_data;
                 this.loading = false;
                 this.error = error;
                 cx.notify();

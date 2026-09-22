@@ -620,7 +620,7 @@ fn format_timestamp(timestamp: i64) -> String {
         .unwrap_or_default()
 }
 
-fn accent_colors_count(accents: &AccentColors) -> usize {
+pub(crate) fn accent_colors_count(accents: &AccentColors) -> usize {
     accents.0.len()
 }
 
@@ -871,7 +871,7 @@ struct CommitLineKey {
     parent: Oid,
 }
 
-struct GraphData {
+pub(crate) struct GraphData {
     lane_states: SmallVec<[LaneState; 8]>,
     lane_colors: HashMap<ActiveLaneIdx, BranchColor>,
     parent_to_lanes: HashMap<Oid, SmallVec<[usize; 1]>>,
@@ -886,7 +886,7 @@ struct GraphData {
 }
 
 impl GraphData {
-    fn new(accent_colors_count: usize) -> Self {
+    pub(crate) fn new(accent_colors_count: usize) -> Self {
         GraphData {
             lane_states: SmallVec::default(),
             lane_colors: HashMap::default(),
@@ -934,7 +934,7 @@ impl GraphData {
         })
     }
 
-    fn add_commits(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
+    pub(crate) fn add_commits(&mut self, commits: &[Arc<InitialGraphCommitData>]) {
         self.commits.reserve(commits.len());
         self.lines.reserve(commits.len() / 2);
 
@@ -7627,4 +7627,53 @@ mod tests {
             assert_eq!(message_entity_id, new_entity_id);
         });
     }
+    #[test]
+    fn test_jj_graph_lanes_from_children_first_entries() {
+        let mut rng = StdRng::seed_from_u64(43);
+
+        let root = Oid::random(&mut rng);
+        let sibling_a = Oid::random(&mut rng);
+        let sibling_b = Oid::random(&mut rng);
+        let merge = Oid::random(&mut rng);
+
+        // jj log order: children first, parents following.
+        let commits = vec![
+            Arc::new(InitialGraphCommitData {
+                sha: merge,
+                parents: smallvec![sibling_a, sibling_b],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: sibling_a,
+                parents: smallvec![root],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: sibling_b,
+                parents: smallvec![root],
+                ref_names: vec![],
+            }),
+            Arc::new(InitialGraphCommitData {
+                sha: root,
+                parents: smallvec![],
+                ref_names: vec![],
+            }),
+        ];
+
+        let mut graph_data = GraphData::new(8);
+        graph_data.add_commits(&commits);
+
+        // The merge lands on the primary lane and its first parent
+        // continues it; the extra parent spawns a second lane.
+        assert_eq!(graph_data.commits.len(), 4);
+        assert_eq!(graph_data.commits[0].lane, 0);
+        assert_eq!(graph_data.commits[1].lane, 0);
+        assert_eq!(graph_data.commits[2].lane, 1);
+        assert_eq!(graph_data.commits[3].lane, 0);
+        assert_eq!(graph_data.max_lanes, 2);
+        assert_eq!(graph_data.lane_states.len(), 2);
+        assert!(graph_data.parent_to_lanes.is_empty());
+        assert_eq!(graph_data.lines.len(), 4);
+    }
+
 }
