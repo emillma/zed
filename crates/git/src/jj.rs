@@ -1,6 +1,13 @@
+use crate::repository::{
+    BranchesScanResult, CommitDataReader, CommitDetails, DiffType, RepoPath,
+};
+use crate::status::{DiffTreeType, GitStatus, TreeDiff};
+use crate::vcs::VcsRepository;
 use anyhow::Result;
 use collections::HashMap;
-use gpui::BackgroundExecutor;
+use futures::future::BoxFuture;
+use futures::FutureExt as _;
+use gpui::{BackgroundExecutor, SharedString, Task};
 use thiserror::Error;
 use util::command::{Command, new_command};
 
@@ -8,6 +15,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 
+#[derive(Clone)]
 pub(crate) struct JjBinary {
     jj_binary_path: PathBuf,
     working_directory: PathBuf,
@@ -139,4 +147,132 @@ struct JjBinaryCommandError {
     stdout: String,
     stderr: String,
     status: ExitStatus,
+}
+
+pub struct JjRepository {
+    jj_binary: JjBinary,
+    work_dir: PathBuf,
+    jj_dir: PathBuf,
+    executor: BackgroundExecutor,
+}
+
+impl JjRepository {
+    pub fn new(
+        jj_binary_path: PathBuf,
+        working_directory: PathBuf,
+        jj_directory: PathBuf,
+        executor: BackgroundExecutor,
+        is_trusted: bool,
+    ) -> Self {
+        Self {
+            jj_binary: JjBinary::new(
+                jj_binary_path,
+                working_directory.clone(),
+                jj_directory.clone(),
+                executor.clone(),
+                is_trusted,
+            ),
+            work_dir: working_directory,
+            jj_dir: jj_directory,
+            executor,
+        }
+    }
+}
+
+impl VcsRepository for JjRepository {
+    fn backend_id(&self) -> &'static str {
+        "jj"
+    }
+
+    fn head_sha(&self) -> BoxFuture<'_, Option<String>> {
+        let jj = self.jj_binary.clone();
+        self.executor
+            .spawn(async move {
+                let output = jj
+                    .run_read_only(&["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+                    .await
+                    .ok()?;
+                let sha = output.trim().to_string();
+                if sha.is_empty() {
+                    None
+                } else {
+                    Some(sha)
+                }
+            })
+            .boxed()
+    }
+
+    fn merge_message(&self) -> BoxFuture<'_, Option<String>> {
+        let jj = self.jj_binary.clone();
+        self.executor
+            .spawn(async move {
+                let output = jj
+                    .run_read_only(&[
+                        "log",
+                        "-r",
+                        "@",
+                        "--no-graph",
+                        "-T",
+                        "description.first_line()",
+                    ])
+                    .await
+                    .ok()?;
+                let message = output.lines().next().unwrap_or_default().trim().to_string();
+                if message.is_empty() {
+                    None
+                } else {
+                    Some(message)
+                }
+            })
+            .boxed()
+    }
+
+    fn path(&self) -> PathBuf {
+        self.work_dir.clone()
+    }
+
+    fn main_repository_path(&self) -> PathBuf {
+        self.jj_dir.clone()
+    }
+
+    fn check_access(&self) -> BoxFuture<'_, Result<()>> {
+        let jj = self.jj_binary.clone();
+        self.executor
+            .spawn(async move {
+                jj.run_read_only(&["workspace", "root"]).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>> {
+        unimplemented!("jj backend: branches not yet wired")
+    }
+
+    fn status(&self, _path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>> {
+        unimplemented!("jj backend: status not yet wired")
+    }
+
+    fn diff(&self, _diff: DiffType) -> BoxFuture<'_, Result<String>> {
+        unimplemented!("jj backend: diff not yet wired")
+    }
+
+    fn diff_tree(&self, _request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
+        unimplemented!("jj backend: diff_tree not yet wired")
+    }
+
+    fn show(&self, _commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
+        unimplemented!("jj backend: show not yet wired")
+    }
+
+    fn commit_data_reader(&self) -> Result<CommitDataReader> {
+        unimplemented!("jj backend: commit_data_reader not yet wired")
+    }
+
+    fn default_branch(
+        &self,
+        _include_remote_name: bool,
+    ) -> BoxFuture<'_, Result<Option<SharedString>>> {
+        unimplemented!("jj backend: default_branch not yet wired")
+    }
 }
