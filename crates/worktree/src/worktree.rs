@@ -5670,6 +5670,15 @@ impl BackgroundScanner {
                             );
                         }
                     }
+                } else if child_name == DOT_JJ {
+                    let mut state = self.state.lock().await;
+                    state
+                        .insert_jj_repository(
+                            child_path.clone(),
+                            self.fs.as_ref(),
+                            self.watcher.as_ref(),
+                        )
+                        .await;
                 }
             }
 
@@ -6557,6 +6566,7 @@ impl BackgroundScanner {
 
         scannable
             || entry.path.file_name() == Some(DOT_GIT)
+            || entry.path.file_name() == Some(DOT_JJ)
             || entry.path.file_name() == Some(local_settings_folder_name())
             || entry.path.file_name() == Some(local_vscode_folder_name())
             || state.scanned_dirs.contains(&entry.id) // If we've ever scanned it, keep scanning
