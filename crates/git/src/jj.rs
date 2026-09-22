@@ -2,7 +2,10 @@ use crate::repository::{
     Branch, BranchesScanResult, CommitDataReader, CommitDetails, DiffType, RepoPath, Upstream,
     UpstreamTrackingStatus,
 };
-use crate::status::{DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff};
+use crate::status::{
+    DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff, UnmergedStatus,
+    UnmergedStatusCode,
+};
 use crate::vcs::VcsRepository;
 use anyhow::Result;
 use collections::HashMap;
@@ -562,7 +565,9 @@ fn is_head_change(bookmark_change_id: &str, head_change_id: &str) -> bool {
 /// so every change is a tracked entry with an unmodified worktree status.
 fn parse_jj_status(output: &str, path_prefixes: &[RepoPath]) -> Result<GitStatus> {
     let mut entries = Vec::new();
+    let mut conflicts = Vec::new();
     let mut in_section = false;
+    let mut in_conflicts = false;
     for line in output.lines() {
         if !in_section {
             if line.trim() == "Working copy changes:" {
@@ -592,12 +597,46 @@ fn parse_jj_status(output: &str, path_prefixes: &[RepoPath]) -> Result<GitStatus
                     }),
                 ));
             }
-            _ => break,
+            _ => {
+                // The working-copy section ends at the first non-change line;
+                // keep scanning for the unresolved-conflicts warning block.
+                if line.trim() == "Warning: There are unresolved conflicts at these paths:" {
+                    in_conflicts = true;
+                } else if in_conflicts {
+                    // Conflict lines: `<path><whitespace run><N>-sided conflict`.
+                    let Some((path_str, tail)) = line.split_once("  ") else {
+                        in_conflicts = false;
+                        continue;
+                    };
+                    let path_str = path_str.trim_end();
+                    if path_str.is_empty() || !tail.contains("-sided conflict") {
+                        in_conflicts = false;
+                        continue;
+                    }
+                    let path = RepoPath::new(path_str)?;
+                    if !path_prefixes.is_empty()
+                        && !path_prefixes.iter().any(|prefix| path.starts_with(prefix))
+                    {
+                        continue;
+                    }
+                    conflicts.push(path.clone());
+                    if !entries.iter().any(|(existing, _)| existing == &path) {
+                        entries.push((
+                            path,
+                            FileStatus::Unmerged(UnmergedStatus {
+                                first_head: UnmergedStatusCode::Updated,
+                                second_head: UnmergedStatusCode::Updated,
+                            }),
+                        ));
+                    }
+                }
+            }
         }
     }
     entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     Ok(GitStatus {
         entries: entries.into(),
+        conflicts,
     })
 }
 
@@ -667,7 +706,9 @@ mod tests {
         "A g.txt\n",
         "A h.txt\n",
         "Working copy  (@) : mpptkwut d1cad5a8 trunk | third\n",
-        "Parent commit (@-): vvqslmxu 8a1abaea feature main* noded | local desc",
+        "Parent commit (@-): vvqslmxu 8a1abaea feature main* noded | local desc\n",
+        "Warning: There are unresolved conflicts at these paths:\n",
+        "conflicted.txt    2-sided conflict",
     );
 
     fn jj_tracked(index_status: StatusCode) -> FileStatus {
@@ -683,11 +724,19 @@ mod tests {
         assert_eq!(
             status.entries,
             Arc::from([
+                (
+                    RepoPath::new("conflicted.txt").unwrap(),
+                    FileStatus::Unmerged(UnmergedStatus {
+                        first_head: UnmergedStatusCode::Updated,
+                        second_head: UnmergedStatusCode::Updated,
+                    })
+                ),
                 (RepoPath::new("f.txt").unwrap(), jj_tracked(StatusCode::Added)),
                 (RepoPath::new("g.txt").unwrap(), jj_tracked(StatusCode::Added)),
                 (RepoPath::new("h.txt").unwrap(), jj_tracked(StatusCode::Added)),
             ])
         );
+        assert_eq!(status.conflicts, vec![RepoPath::new("conflicted.txt").unwrap()]);
     }
 
     #[test]

@@ -430,6 +430,9 @@ impl std::ops::Sub for GitSummary {
 #[derive(Clone, Debug)]
 pub struct GitStatus {
     pub entries: Arc<[(RepoPath, FileStatus)]>,
+    /// Paths with unresolved conflicts (populated by the jj backend; git
+    /// surfaces conflicts as `FileStatus::Unmerged` entries instead).
+    pub conflicts: Vec<RepoPath>,
 }
 
 impl FromStr for GitStatus {
@@ -486,6 +489,7 @@ impl FromStr for GitStatus {
         });
         Ok(Self {
             entries: entries.into(),
+            conflicts: Vec::new(),
         })
     }
 }
@@ -494,6 +498,7 @@ impl Default for GitStatus {
     fn default() -> Self {
         Self {
             entries: Arc::new([]),
+            conflicts: Vec::new(),
         }
     }
 }
