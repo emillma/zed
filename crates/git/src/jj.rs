@@ -2,7 +2,7 @@ use crate::repository::{
     Branch, BranchesScanResult, CommitDataReader, CommitDetails, DiffType, RepoPath, Upstream,
     UpstreamTrackingStatus,
 };
-use crate::status::{DiffTreeType, GitStatus, TreeDiff};
+use crate::status::{DiffTreeType, FileStatus, GitStatus, StatusCode, TrackedStatus, TreeDiff};
 use crate::vcs::VcsRepository;
 use anyhow::Result;
 use collections::HashMap;
@@ -266,16 +266,39 @@ impl VcsRepository for JjRepository {
             .boxed()
     }
 
-    fn status(&self, _path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>> {
-        unimplemented!("jj backend: status not yet wired")
+    fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>> {
+        let jj = self.jj_binary.clone();
+        let path_prefixes = path_prefixes.to_vec();
+        self.executor.spawn(async move {
+            let output = jj.run_read_only(&["status"]).await?;
+            parse_jj_status(&output, &path_prefixes)
+        })
     }
 
-    fn diff(&self, _diff: DiffType) -> BoxFuture<'_, Result<String>> {
-        unimplemented!("jj backend: diff not yet wired")
+    fn diff(&self, diff: DiffType) -> BoxFuture<'_, Result<String>> {
+        let jj = self.jj_binary.clone();
+        self.executor
+            .spawn(async move {
+                // jj has no index, so HeadToIndex and HeadToWorktree produce the same diff.
+                let args = match &diff {
+                    DiffType::HeadToIndex | DiffType::HeadToWorktree => vec!["diff", "--git"],
+                    DiffType::MergeBase { base_ref } => {
+                        vec!["diff", "--git", "--from", base_ref.as_str(), "--to", "@"]
+                    }
+                };
+                jj.run_read_only(&args).await
+            })
+            .boxed()
     }
 
     fn diff_tree(&self, _request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
-        unimplemented!("jj backend: diff_tree not yet wired")
+        // Slice A doesn't consume diff_tree; an honest error beats fake OIDs.
+        async move {
+            Err(anyhow::anyhow!(
+                "jj backend: tree diff not yet supported (jj's abbreviated blob ids cannot fill TreeDiffStatus::Modified/Deleted old Oids)"
+            ))
+        }
+        .boxed()
     }
 
     fn show(&self, _commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
@@ -381,8 +404,55 @@ fn is_head_change(bookmark_change_id: &str, head_change_id: &str) -> bool {
             || bookmark_change_id.starts_with(head_change_id))
 }
 
+/// Parses `jj status` output into a GitStatus.
+///
+/// Only the "Working copy changes" section is consumed, stopping at the
+/// following section header. jj's working-copy commit plays the index role,
+/// so every change is a tracked entry with an unmodified worktree status.
+fn parse_jj_status(output: &str, path_prefixes: &[RepoPath]) -> Result<GitStatus> {
+    let mut entries = Vec::new();
+    let mut in_section = false;
+    for line in output.lines() {
+        if !in_section {
+            if line.trim() == "Working copy changes:" {
+                in_section = true;
+            }
+            continue;
+        }
+        match line.split_once(' ') {
+            Some((letter, path)) if matches!(letter, "A" | "M" | "D" | "R") => {
+                let path = RepoPath::new(path)?;
+                if !path_prefixes.is_empty()
+                    && !path_prefixes.iter().any(|prefix| path.starts_with(prefix))
+                {
+                    continue;
+                }
+                let index_status = match letter {
+                    "A" => StatusCode::Added,
+                    "M" => StatusCode::Modified,
+                    "D" => StatusCode::Deleted,
+                    _ => StatusCode::Renamed,
+                };
+                entries.push((
+                    path,
+                    FileStatus::Tracked(TrackedStatus {
+                        index_status,
+                        worktree_status: StatusCode::Unmodified,
+                    }),
+                ));
+            }
+            _ => break,
+        }
+    }
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(GitStatus {
+        entries: entries.into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
 
     const BOOKMARK_LIST_OUTPUT: &str = concat!(
@@ -437,5 +507,74 @@ mod tests {
         let branches = parse_bookmarks(BOOKMARK_LIST_OUTPUT, "qqqqqqqqqqqq");
         assert!(!branches.is_empty());
         assert!(branches.iter().all(|branch| !branch.is_head));
+    }
+
+
+    const JJ_STATUS_OUTPUT: &str = concat!(
+        "Working copy changes:\n",
+        "A f.txt\n",
+        "A g.txt\n",
+        "A h.txt\n",
+        "Working copy  (@) : mpptkwut d1cad5a8 trunk | third\n",
+        "Parent commit (@-): vvqslmxu 8a1abaea feature main* noded | local desc",
+    );
+
+    fn jj_tracked(index_status: StatusCode) -> FileStatus {
+        FileStatus::Tracked(TrackedStatus {
+            index_status,
+            worktree_status: StatusCode::Unmodified,
+        })
+    }
+
+    #[test]
+    fn test_parse_jj_status() {
+        let status = parse_jj_status(JJ_STATUS_OUTPUT, &[]).unwrap();
+        assert_eq!(
+            status.entries,
+            Arc::from([
+                (RepoPath::new("f.txt").unwrap(), jj_tracked(StatusCode::Added)),
+                (RepoPath::new("g.txt").unwrap(), jj_tracked(StatusCode::Added)),
+                (RepoPath::new("h.txt").unwrap(), jj_tracked(StatusCode::Added)),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_jj_status_modified_deleted_renamed() {
+        const OUTPUT: &str = concat!(
+            "Working copy changes:\n",
+            "M a.txt\n",
+            "D b.txt\n",
+            "R c.txt\n",
+            "Working copy  (@) : mpptkwut d1cad5a8 trunk | third",
+        );
+        let status = parse_jj_status(OUTPUT, &[]).unwrap();
+        assert_eq!(
+            status.entries,
+            Arc::from([
+                (RepoPath::new("a.txt").unwrap(), jj_tracked(StatusCode::Modified)),
+                (RepoPath::new("b.txt").unwrap(), jj_tracked(StatusCode::Deleted)),
+                (RepoPath::new("c.txt").unwrap(), jj_tracked(StatusCode::Renamed)),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_jj_status_filters_prefixes() {
+        const OUTPUT: &str = concat!(
+            "Working copy changes:\n",
+            "A src/a.txt\n",
+            "A top.txt\n",
+            "Working copy  (@) : mpptkwut d1cad5a8 trunk | third",
+        );
+        let src = RepoPath::new("src").unwrap();
+        let status = parse_jj_status(OUTPUT, &[src]).unwrap();
+        assert_eq!(
+            status.entries,
+            Arc::from([(
+                RepoPath::new("src/a.txt").unwrap(),
+                jj_tracked(StatusCode::Added)
+            )])
+        );
     }
 }
