@@ -1,11 +1,15 @@
 use anyhow::Result;
-use crate::git_graph::{GraphData, accent_colors_count};
+use crate::git_graph::{
+    GraphData, accent_colors_count, draw_commit_circle, lane_center_x, COMMIT_CIRCLE_RADIUS,
+    LANE_WIDTH, LEFT_PADDING, LINE_WIDTH,
+};
 use git::{jj::JjLogEntry, repository::InitialGraphCommitData, Oid};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Subscription,
-    Task, WeakEntity, Window, actions, uniform_list,
+    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, PathBuilder, Render,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, px, point, uniform_list,
 };
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,6 +24,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Maximum number of log entries fetched for the history panel.
 const LOG_LIMIT: usize = 200;
+
+/// Fixed row height for the history list and the graph canvas; rows are
+/// uniform so the canvas can position circles at `index * ROW_HEIGHT`.
+const ROW_HEIGHT: Pixels = px(72.);
 
 /// The jj history panel: a list of the first 200 changes of the first
 /// jj repository in the project, if any.
@@ -147,6 +155,70 @@ impl JjLog {
     }
 }
 
+impl JjLog {
+    /// Renders the lane graph as a full-content-height canvas; the shared
+    /// scroll container moves it in lockstep with the list, so no scroll
+    /// offset math is needed. Connector lines are straight (v1); GitGraph's
+    /// curve geometry can be ported later.
+    fn render_graph_canvas(&self, item_count: usize) -> impl IntoElement {
+        let content_height = ROW_HEIGHT * item_count as f32;
+        let commits = self
+            .graph_data
+            .as_ref()
+            .map(|graph| graph.commits.clone())
+            .unwrap_or_default();
+        let lane_count = commits.iter().map(|commit| commit.lane).max().unwrap_or(0) + 1;
+        let graph_width = LEFT_PADDING * 2.0 + LANE_WIDTH * lane_count as f32;
+        let row_by_sha: HashMap<Oid, usize> = commits
+            .iter()
+            .enumerate()
+            .map(|(ix, commit)| (commit.data.sha, ix))
+            .collect();
+
+        canvas(
+            move |_bounds, _window, _cx| {},
+            move |bounds: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
+                window.paint_layer(bounds, |window| {
+                    let accent_colors = cx.theme().accents();
+                    // Connector lines first, so circles paint on top. Children
+                    // come first in the log, so parents sit at higher rows.
+                    for (ix, commit) in commits.iter().enumerate() {
+                        let from_x = lane_center_x(bounds, commit.lane as f32);
+                        let from_y = bounds.origin.y + ix as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0;
+                        for parent in &commit.data.parents {
+                            let Some(&parent_row) = row_by_sha.get(parent) else {
+                                continue;
+                            };
+                            let to_commit = &commits[parent_row];
+                            let to_x = lane_center_x(bounds, to_commit.lane as f32);
+                            let to_y = bounds.origin.y
+                                + parent_row as f32 * ROW_HEIGHT
+                                + ROW_HEIGHT / 2.0;
+                            let mut builder = PathBuilder::stroke(LINE_WIDTH);
+                            builder.move_to(point(from_x, from_y + COMMIT_CIRCLE_RADIUS));
+                            builder.line_to(point(to_x, to_y - COMMIT_CIRCLE_RADIUS));
+                            if let Ok(path) = builder.build() {
+                                let color =
+                                    accent_colors.0[commit.color_idx % accent_colors.0.len()];
+                                window.paint_path(path, color);
+                            }
+                        }
+                    }
+                    // Commit circles on top.
+                    for (ix, commit) in commits.iter().enumerate() {
+                        let x = lane_center_x(bounds, commit.lane as f32);
+                        let y = bounds.origin.y + ix as f32 * ROW_HEIGHT + ROW_HEIGHT / 2.0;
+                        let color = accent_colors.0[commit.color_idx % accent_colors.0.len()];
+                        draw_commit_circle(x, y, color, window);
+                    }
+                })
+            },
+        )
+        .w(graph_width)
+        .h(content_height)
+    }
+}
+
 impl Render for JjLog {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let entries = self.entries.clone();
@@ -169,11 +241,20 @@ impl Render for JjLog {
                 .child(Label::new("no jj repository").color(Color::Muted));
         }
         let item_count = entries.len();
+        let graph_canvas = self.render_graph_canvas(item_count);
         v_flex()
             .flex_1()
             .size_full()
             .overflow_hidden()
-            .child(uniform_list(
+            .child(
+                h_flex()
+                    .id("jj_log_scroll")
+                    .w_full()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .child(graph_canvas)
+                    .child(
+                        uniform_list(
                 "jj_log_list",
                 item_count,
                 move |range, _window, _cx| {
@@ -196,6 +277,7 @@ impl Render for JjLog {
                             v_flex()
                                 .id(("jj-log-item", index))
                                 .w_full()
+                                .h(ROW_HEIGHT)
                                 .py_1()
                                 .px_2()
                                 .gap_0p5()
@@ -219,7 +301,11 @@ impl Render for JjLog {
                         })
                         .collect()
                 },
-            ))
+                            )
+                            .h(ROW_HEIGHT * item_count as f32)
+                            .overflow_hidden(),
+                    ),
+            )
     }
 }
 

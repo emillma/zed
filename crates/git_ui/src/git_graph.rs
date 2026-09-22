@@ -62,11 +62,11 @@ use workspace::{
     item::{Item, ItemEvent, TabTooltipContent},
 };
 
-const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
+pub(crate) const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
-const LANE_WIDTH: Pixels = px(16.0);
-const LEFT_PADDING: Pixels = px(12.0);
-const LINE_WIDTH: Pixels = px(1.5);
+pub(crate) const LANE_WIDTH: Pixels = px(16.0);
+pub(crate) const LEFT_PADDING: Pixels = px(12.0);
+pub(crate) const LINE_WIDTH: Pixels = px(1.5);
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
 const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
@@ -789,10 +789,10 @@ impl LaneState {
     }
 }
 
-struct CommitEntry {
-    data: Arc<InitialGraphCommitData>,
-    lane: usize,
-    color_idx: usize,
+pub(crate) struct CommitEntry {
+    pub(crate) data: Arc<InitialGraphCommitData>,
+    pub(crate) lane: usize,
+    pub(crate) color_idx: usize,
 }
 
 type ActiveLaneIdx = usize;
@@ -877,7 +877,7 @@ pub(crate) struct GraphData {
     parent_to_lanes: HashMap<Oid, SmallVec<[usize; 1]>>,
     next_color: BranchColor,
     accent_colors_count: usize,
-    commits: Vec<Rc<CommitEntry>>,
+    pub(crate) commits: Vec<Rc<CommitEntry>>,
     max_commit_count: AllCommitCount,
     max_lanes: usize,
     lines: Vec<Rc<CommitLine>>,
@@ -1229,7 +1229,7 @@ pub fn open_or_reuse_graph(
     }
 }
 
-fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
+pub(crate) fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
     bounds.origin.x + LEFT_PADDING + lane * LANE_WIDTH + LANE_WIDTH / 2.0
 }
 
@@ -1242,7 +1242,7 @@ fn to_row_center(
     bounds.origin.y + to_row as f32 * row_height + row_height / 2.0 - scroll_offset
 }
 
-fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &mut Window) {
+pub(crate) fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &mut Window) {
     let radius = COMMIT_CIRCLE_RADIUS;
 
     let mut builder = PathBuilder::fill();
