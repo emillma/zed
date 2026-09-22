@@ -29,8 +29,8 @@ use util::{
     rel_path::RelPath,
 };
 use worktree::{
-    CreatedEntry, Entry, ProjectEntryId, UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree,
-    WorktreeId,
+    CreatedEntry, Entry, ProjectEntryId, UpdatedEntriesSet, UpdatedGitRepositoriesSet,
+    UpdatedJjRepositoriesSet, Worktree, WorktreeId,
 };
 
 use crate::{ProjectPath, trusted_worktrees::TrustedWorktrees};
@@ -227,6 +227,7 @@ pub enum WorktreeStoreEvent {
     WorktreeUpdateSent(Entity<Worktree>),
     WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
     WorktreeUpdatedGitRepositories(WorktreeId, UpdatedGitRepositoriesSet),
+    WorktreeUpdatedJjRepositories(WorktreeId, UpdatedJjRepositoriesSet),
     WorktreeDeletedEntry(WorktreeId, ProjectEntryId),
     WorktreeUpdatedRootRepoCommonDir(WorktreeId),
 }
@@ -984,6 +985,12 @@ impl WorktreeStore {
                 }
                 worktree::Event::UpdatedGitRepositories(set) => {
                     cx.emit(WorktreeStoreEvent::WorktreeUpdatedGitRepositories(
+                        worktree_id,
+                        set.clone(),
+                    ));
+                }
+                worktree::Event::UpdatedJjRepositories(set) => {
+                    cx.emit(WorktreeStoreEvent::WorktreeUpdatedJjRepositories(
                         worktree_id,
                         set.clone(),
                     ));

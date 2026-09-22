@@ -2468,6 +2468,7 @@ impl GitStore {
                     .detach();
                 }
             }
+            WorktreeStoreEvent::WorktreeUpdatedJjRepositories(_, _) => {}
             WorktreeStoreEvent::WorktreeUpdatedGitRepositories(worktree_id, changed_repos) => {
                 let Some(worktree) = worktree_store.read(cx).worktree_for_id(*worktree_id, cx)
                 else {

@@ -81,6 +81,7 @@ use util::{
 pub use worktree_settings::WorktreeSettings;
 
 pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
+const DOT_JJ: &str = ".jj";
 
 /// A set of local or remote files that are being opened as part of a project.
 /// Responsible for tracking related FS (for local)/collab (for remote) events and corresponding updates.
@@ -259,6 +260,9 @@ pub struct LocalSnapshot {
     /// All of the git repositories in the worktree, indexed by the project entry
     /// id of their parent directory.
     git_repositories: TreeMap<ProjectEntryId, LocalRepositoryEntry>,
+    /// All of the jj repositories in the worktree, indexed by the project entry
+    /// id of their parent directory.
+    jj_repositories: TreeMap<ProjectEntryId, LocalRepositoryEntry>,
     /// The file handle of the worktree root
     /// (so we can find it after it's been moved)
     root_file_handle: Option<Arc<dyn fs::FileHandle>>,
@@ -464,6 +468,7 @@ struct UpdateObservationState {
 pub enum Event {
     UpdatedEntries(UpdatedEntriesSet),
     UpdatedGitRepositories(UpdatedGitRepositoriesSet),
+    UpdatedJjRepositories(UpdatedJjRepositoriesSet),
     UpdatedRootRepoCommonDir {
         old: Option<Arc<SanitizedPath>>,
     },
@@ -525,6 +530,7 @@ impl Worktree {
                 global_gitignore: Default::default(),
                 repo_exclude_by_work_dir_abs_path: Default::default(),
                 git_repositories: Default::default(),
+                jj_repositories: Default::default(),
                 external_canonical_to_relative: Default::default(),
                 snapshot: Snapshot::new(
                     worktree_id,
@@ -1441,6 +1447,7 @@ impl LocalWorktree {
         cx: &mut Context<Worktree>,
     ) {
         let repo_changes = self.changed_repos(&self.snapshot, &mut new_snapshot);
+        let jj_repo_changes = self.changed_jj_repos(&self.snapshot, &mut new_snapshot);
 
         if let Some((common_dir, is_linked_worktree)) = new_snapshot
             .local_repo_for_work_directory_path(RelPath::empty())
@@ -1478,6 +1485,9 @@ impl LocalWorktree {
         }
         if !repo_changes.is_empty() {
             cx.emit(Event::UpdatedGitRepositories(repo_changes));
+        }
+        if !jj_repo_changes.is_empty() {
+            cx.emit(Event::UpdatedJjRepositories(jj_repo_changes));
         }
         if let Some(old) = old_root_repo_common_dir {
             cx.emit(Event::UpdatedRootRepoCommonDir { old });
@@ -1591,6 +1601,113 @@ impl LocalWorktree {
                         dot_git_abs_path: Some(repo.dot_git_abs_path.clone()),
                         repository_dir_abs_path: Some(repo.repository_dir_abs_path.clone()),
                         common_dir_abs_path: Some(repo.common_dir_abs_path.clone()),
+                    });
+                    old_repos.next();
+                }
+                (None, None) => break,
+            }
+        }
+
+        fn clone<T: Clone, U: Clone>(value: &(&T, &U)) -> (T, U) {
+            (value.0.clone(), value.1.clone())
+        }
+
+        changes.into()
+    }
+
+    fn changed_jj_repos(
+        &self,
+        old_snapshot: &LocalSnapshot,
+        new_snapshot: &mut LocalSnapshot,
+    ) -> UpdatedJjRepositoriesSet {
+        let mut changes = Vec::new();
+        let mut old_repos = old_snapshot.jj_repositories.iter().peekable();
+        let new_repos = new_snapshot.jj_repositories.clone();
+        let mut new_repos = new_repos.iter().peekable();
+
+        loop {
+            match (new_repos.peek().map(clone), old_repos.peek().map(clone)) {
+                (Some((new_entry_id, new_repo)), Some((old_entry_id, old_repo))) => {
+                    match Ord::cmp(&new_entry_id, &old_entry_id) {
+                        Ordering::Less => {
+                            changes.push(UpdatedJjRepository {
+                                work_directory_id: new_entry_id,
+                                old_work_directory_abs_path: None,
+                                new_work_directory_abs_path: Some(
+                                    new_repo.work_directory_abs_path.clone(),
+                                ),
+                                dot_jj_abs_path: Some(new_repo.dot_git_abs_path.clone()),
+                                repository_dir_abs_path: Some(
+                                    new_repo.repository_dir_abs_path.clone(),
+                                ),
+                                common_dir_abs_path: Some(new_repo.common_dir_abs_path.clone()),
+                            });
+                            new_repos.next();
+                        }
+                        Ordering::Equal => {
+                            debug_assert!(
+                                new_repo.git_dir_scan_id >= old_repo.git_dir_scan_id,
+                                "git_dir_scan_id for jj repository at {:?} regressed from {} to {}",
+                                new_repo.work_directory_abs_path,
+                                old_repo.git_dir_scan_id,
+                                new_repo.git_dir_scan_id,
+                            );
+                            if new_repo.git_dir_scan_id != old_repo.git_dir_scan_id
+                                || new_repo.work_directory_abs_path
+                                    != old_repo.work_directory_abs_path
+                            {
+                                changes.push(UpdatedJjRepository {
+                                    work_directory_id: new_entry_id,
+                                    old_work_directory_abs_path: Some(
+                                        old_repo.work_directory_abs_path.clone(),
+                                    ),
+                                    new_work_directory_abs_path: Some(
+                                        new_repo.work_directory_abs_path.clone(),
+                                    ),
+                                    dot_jj_abs_path: Some(new_repo.dot_git_abs_path.clone()),
+                                    repository_dir_abs_path: Some(
+                                        new_repo.repository_dir_abs_path.clone(),
+                                    ),
+                                    common_dir_abs_path: Some(new_repo.common_dir_abs_path.clone()),
+                                });
+                            }
+                            new_repos.next();
+                            old_repos.next();
+                        }
+                        Ordering::Greater => {
+                            changes.push(UpdatedJjRepository {
+                                work_directory_id: old_entry_id,
+                                old_work_directory_abs_path: Some(
+                                    old_repo.work_directory_abs_path.clone(),
+                                ),
+                                new_work_directory_abs_path: None,
+                                dot_jj_abs_path: None,
+                                repository_dir_abs_path: None,
+                                common_dir_abs_path: None,
+                            });
+                            old_repos.next();
+                        }
+                    }
+                }
+                (Some((entry_id, repo)), None) => {
+                    changes.push(UpdatedJjRepository {
+                        work_directory_id: entry_id,
+                        old_work_directory_abs_path: None,
+                        new_work_directory_abs_path: Some(repo.work_directory_abs_path.clone()),
+                        dot_jj_abs_path: Some(repo.dot_git_abs_path.clone()),
+                        repository_dir_abs_path: Some(repo.repository_dir_abs_path.clone()),
+                        common_dir_abs_path: Some(repo.common_dir_abs_path.clone()),
+                    });
+                    new_repos.next();
+                }
+                (None, Some((entry_id, repo))) => {
+                    changes.push(UpdatedJjRepository {
+                        work_directory_id: entry_id,
+                        old_work_directory_abs_path: Some(repo.work_directory_abs_path.clone()),
+                        new_work_directory_abs_path: None,
+                        dot_jj_abs_path: None,
+                        repository_dir_abs_path: None,
+                        common_dir_abs_path: None,
                     });
                     old_repos.next();
                 }
@@ -2233,6 +2350,7 @@ impl LocalWorktree {
         cx: &Context<Worktree>,
     ) {
         self.snapshot.git_repositories = Default::default();
+        self.snapshot.jj_repositories = Default::default();
         self.snapshot.ignores_by_parent_abs_path = Default::default();
         let root_name = new_path
             .as_path()
@@ -3644,6 +3762,89 @@ impl BackgroundScannerState {
         log::trace!("inserting new local git repository");
         Ok(local_repository)
     }
+
+    async fn insert_jj_repository(
+        &mut self,
+        dot_jj_path: Arc<RelPath>,
+        fs: &dyn Fs,
+        watcher: &dyn Watcher,
+    ) {
+        let work_dir_path: Arc<RelPath> = match dot_jj_path.parent() {
+            Some(parent_dir) => {
+                // Guard against repositories inside the repository metadata
+                if parent_dir.components().any(|component| component == DOT_JJ) {
+                    log::debug!(
+                        "not building jj repository for nested `.jj` directory, `.jj` path in the worktree: {dot_jj_path:?}"
+                    );
+                    return;
+                }
+                parent_dir.into()
+            }
+            None => {
+                // `dot_jj_path.parent().is_none()` means the `.jj` directory is the
+                // opened worktree itself, so no repository is built around it.
+                log::debug!(
+                    "not building jj repository for the worktree itself, `.jj` path in the worktree: {dot_jj_path:?}"
+                );
+                return;
+            }
+        };
+
+        let dot_jj_abs_path: Arc<Path> = Arc::from(self.snapshot.absolutize(&dot_jj_path).as_ref());
+        if !fs.is_dir(dot_jj_abs_path.as_ref()).await {
+            return;
+        }
+
+        let work_dir_entry = match self.snapshot.entry_for_path(&work_dir_path) {
+            Some(entry) => entry,
+            None => {
+                log::debug!(
+                    "not building jj repository for unindexed working directory `{work_dir_path:?}`"
+                );
+                return;
+            }
+        };
+        let work_directory = WorkDirectory::InProject {
+            relative_path: work_dir_path,
+        };
+        let work_directory_abs_path = self.snapshot.work_directory_abs_path(&work_directory);
+
+        // A jj repository stores all of its state in the `.jj` directory, so
+        // there is no common/repo directory split like git has.
+        let common_dir_abs_path = dot_jj_abs_path.clone();
+        let repository_dir_abs_path = dot_jj_abs_path.clone();
+
+        watcher
+            .add(&common_dir_abs_path)
+            .context("failed to add `.jj` directory to watcher")
+            .log_err();
+
+        let work_directory_id = work_dir_entry.id;
+
+        // A repository can be re-inserted when its `.jj` entry is re-discovered,
+        // e.g. during a watcher-forced rescan. Carry the existing scan id
+        // forward, mirroring `insert_git_repository_for_path`.
+        let jj_dir_scan_id = self
+            .snapshot
+            .jj_repositories
+            .get(&work_directory_id)
+            .map_or(0, |existing_repository| existing_repository.git_dir_scan_id);
+
+        self.snapshot.jj_repositories.insert(
+            work_directory_id,
+            LocalRepositoryEntry {
+                work_directory_id,
+                work_directory,
+                work_directory_abs_path: work_directory_abs_path.as_path().into(),
+                git_dir_scan_id: jj_dir_scan_id,
+                dot_git_abs_path: dot_jj_abs_path,
+                common_dir_abs_path,
+                repository_dir_abs_path,
+            },
+        );
+
+        log::trace!("inserting new local jj repository");
+    }
 }
 
 /// Watches the directories inside a git directory that git writes ref updates to.
@@ -3711,6 +3912,15 @@ async fn is_dot_git(path: &Path, fs: &dyn Fs) -> bool {
     }
     let config_metadata = fs.metadata(&path.join("config")).await;
     matches!(config_metadata, Ok(Some(_)))
+}
+
+async fn is_dot_jj(path: &Path, fs: &dyn Fs) -> bool {
+    if let Some(file_name) = path.file_name()
+        && file_name == DOT_JJ
+    {
+        return fs.is_dir(path).await;
+    }
+    false
 }
 
 async fn build_gitignore(abs_path: &Path, fs: &dyn Fs) -> Result<Gitignore> {
@@ -4031,8 +4241,24 @@ pub struct UpdatedGitRepository {
     pub common_dir_abs_path: Option<Arc<Path>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdatedJjRepository {
+    /// ID of the repository's working directory.
+    ///
+    /// For a repo that's above the worktree root, this is the ID of the worktree root, and hence not unique.
+    /// It's included here to aid the jj store in detecting when a repository's working directory is renamed.
+    pub work_directory_id: ProjectEntryId,
+    pub old_work_directory_abs_path: Option<Arc<Path>>,
+    pub new_work_directory_abs_path: Option<Arc<Path>>,
+    /// The absolute path to the `.jj` directory of the repository.
+    pub dot_jj_abs_path: Option<Arc<Path>>,
+    pub repository_dir_abs_path: Option<Arc<Path>>,
+    pub common_dir_abs_path: Option<Arc<Path>>,
+}
+
 pub type UpdatedEntriesSet = Arc<[(Arc<RelPath>, ProjectEntryId, PathChange)]>;
 pub type UpdatedGitRepositoriesSet = Arc<[UpdatedGitRepository]>;
+pub type UpdatedJjRepositoriesSet = Arc<[UpdatedJjRepository]>;
 
 #[derive(Clone, Debug)]
 pub struct PathProgress<'a> {
@@ -4831,6 +5057,7 @@ impl BackgroundScanner {
         ];
 
         let mut dot_git_abs_paths = Vec::new();
+        let mut dot_jj_abs_paths = Vec::new();
         let mut work_dirs_needing_exclude_update = Vec::new();
 
         {
@@ -4863,6 +5090,18 @@ impl BackgroundScanner {
                                 .strip_prefix(ancestor)
                                 .expect("stripping off the ancestor");
                             dot_git_paths = Some((ancestor.to_owned(), path_in_git_dir.to_owned()));
+                            break;
+                        }
+                    }
+                }
+
+                if self.track_git_repositories {
+                    for ancestor in abs_path.as_path().ancestors() {
+                        if is_dot_jj(ancestor, self.fs.as_ref()).await {
+                            let dot_jj_abs_path = ancestor.to_owned();
+                            if !dot_jj_abs_paths.contains(&dot_jj_abs_path) {
+                                dot_jj_abs_paths.push(dot_jj_abs_path);
+                            }
                             break;
                         }
                     }
@@ -5143,11 +5382,14 @@ impl BackgroundScanner {
         )
         .await;
 
-        let affected_repo_roots = if !dot_git_abs_paths.is_empty() {
+        let mut affected_repo_roots = if !dot_git_abs_paths.is_empty() {
             self.update_git_repositories(dot_git_abs_paths).await
         } else {
             Vec::new()
         };
+        if !dot_jj_abs_paths.is_empty() {
+            affected_repo_roots.extend(self.update_jj_repositories(dot_jj_abs_paths).await);
+        }
 
         {
             let mut ignores_to_update = self.ignores_needing_update().await;
@@ -6193,6 +6435,92 @@ impl BackgroundScanner {
                 }
                 preserve
             });
+
+        affected_repo_roots
+    }
+
+    async fn update_jj_repositories(&self, dot_jj_paths: Vec<PathBuf>) -> Vec<Arc<Path>> {
+        log::trace!("reloading jj repositories: {dot_jj_paths:?}");
+        let mut state = self.state.lock().await;
+        let scan_id = state.snapshot.scan_id;
+        let mut affected_repo_roots = Vec::new();
+        for dot_jj_dir in dot_jj_paths {
+            // A jj repository's state all lives in its `.jj` directory, so the
+            // entry's `.jj` path (stored in `dot_git_abs_path`) is enough to match it.
+            let existing_work_directory_ids = state
+                .snapshot
+                .jj_repositories
+                .iter()
+                .filter_map(|(&work_directory_id, repo)| {
+                    let dot_jj_dir = SanitizedPath::new(&dot_jj_dir);
+                    if SanitizedPath::new(repo.dot_git_abs_path.as_ref()) == dot_jj_dir {
+                        Some(work_directory_id)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            if existing_work_directory_ids.is_empty() {
+                let Ok(relative) = dot_jj_dir.strip_prefix(state.snapshot.abs_path()) else {
+                    // A `.jj` path outside the worktree root is not ours to register.
+                    continue;
+                };
+                affected_repo_roots.push(dot_jj_dir.parent().unwrap().into());
+                state
+                    .insert_jj_repository(
+                        RelPath::new(relative, PathStyle::local())
+                            .unwrap()
+                            .into_arc(),
+                        self.fs.as_ref(),
+                        self.watcher.as_ref(),
+                    )
+                    .await;
+            } else {
+                for work_directory_id in existing_work_directory_ids {
+                    state
+                        .snapshot
+                        .jj_repositories
+                        .update(&work_directory_id, |entry| {
+                            entry.git_dir_scan_id = scan_id;
+                        });
+                }
+            }
+        }
+
+        // Remove any jj repositories whose `.jj` entry no longer exists.
+        let snapshot = &mut state.snapshot;
+        let mut ids_to_preserve = HashSet::default();
+        for (&work_directory_id, entry) in snapshot.jj_repositories.iter() {
+            let exists_in_snapshot =
+                snapshot
+                    .entry_for_id(work_directory_id)
+                    .is_some_and(|entry| {
+                        snapshot
+                            .entry_for_path(
+                                &entry.path.join(RelPath::from_unix_str(DOT_JJ).unwrap()),
+                            )
+                            .is_some()
+                    });
+
+            // Only drop a repository when we can positively confirm that its `.jj`
+            // directory is gone; `metadata` returns `Ok(None)` for a confirmed
+            // absence, but `Err(_)` for a transient failure.
+            let dot_jj_present =
+                !matches!(self.fs.metadata(&entry.dot_git_abs_path).await, Ok(None));
+
+            if exists_in_snapshot || dot_jj_present {
+                ids_to_preserve.insert(work_directory_id);
+            }
+        }
+
+        snapshot.jj_repositories.retain(|work_directory_id, entry| {
+            let preserve = ids_to_preserve.contains(work_directory_id);
+            if !preserve {
+                affected_repo_roots.push(entry.dot_git_abs_path.parent().unwrap().into());
+            }
+            preserve
+        });
 
         affected_repo_roots
     }

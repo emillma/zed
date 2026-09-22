@@ -3959,6 +3959,7 @@ impl Project {
             }
             // Listen to the GitStore instead.
             WorktreeStoreEvent::WorktreeUpdatedGitRepositories(_, _) => {}
+            WorktreeStoreEvent::WorktreeUpdatedJjRepositories(_, _) => {}
             WorktreeStoreEvent::WorktreeUpdatedRootRepoCommonDir(worktree_id) => {
                 cx.emit(Event::WorktreeUpdatedRootRepoCommonDir(*worktree_id));
                 self.emit_group_key_changed_if_needed(cx);
