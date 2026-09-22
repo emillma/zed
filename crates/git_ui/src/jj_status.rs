@@ -68,7 +68,6 @@ impl JjStatusIndicator {
             }
         }
         self.poll_scheduled = true;
-        self.last_poll = Some(Instant::now());
         let repository = self
             .project
             .read(cx)
@@ -97,6 +96,13 @@ impl JjStatusIndicator {
             };
             this.update(cx, move |this, cx| {
                 this.poll_scheduled = false;
+                // Only a poll that actually invoked `jj` consumes the throttle
+                // interval; a no-op poll (no jj repository yet) must not delay
+                // the next trigger, or the event carrying the newly discovered
+                // repository gets dropped and the item stays blank.
+                if repository.is_some() {
+                    this.last_poll = Some(Instant::now());
+                }
                 this.text = text;
                 if let Some(error) = error {
                     if !this.warned {
