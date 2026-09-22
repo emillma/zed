@@ -178,6 +178,17 @@ impl JjRepository {
             executor,
         }
     }
+
+    /// Runs a read-only `jj` command in the repository's working directory.
+    pub fn run_read_only<S>(&self, args: Vec<S>) -> BoxFuture<'static, Result<String>>
+    where
+        S: AsRef<OsStr> + Send + Sync + 'static,
+    {
+        let jj = self.jj_binary.clone();
+        self.executor
+            .spawn(async move { jj.run_read_only(&args).await })
+            .boxed()
+    }
 }
 
 impl VcsRepository for JjRepository {

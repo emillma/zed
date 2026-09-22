@@ -141,6 +141,12 @@ pub struct JjRepositoryState {
     backend: Option<Arc<JjRepository>>,
 }
 
+impl JjRepositoryState {
+    pub fn backend(&self) -> Option<&Arc<JjRepository>> {
+        self.backend.as_ref()
+    }
+}
+
 impl ParkedRepository {
     #[cfg(feature = "test-support")]
     pub fn work_directory_abs_path(&self) -> &Path {

@@ -46,6 +46,7 @@ pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
+mod jj_status;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
@@ -59,6 +60,7 @@ pub mod unstaged_diff;
 
 pub use blame_ui::GitBlameStatus;
 pub use conflict_view::MergeConflictIndicator;
+pub use jj_status::JjStatusIndicator;
 
 pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
