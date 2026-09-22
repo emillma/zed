@@ -821,6 +821,10 @@ pub trait GitRepository: crate::vcs::VcsRepository {
     fn load_revisions(&self, revisions: Vec<String>)
     -> BoxFuture<'_, Result<Vec<Option<Vec<u8>>>>>;
 
+    /// The content of `path` at the diff base (HEAD); `Ok(None)` if the file
+    /// does not exist there.
+    fn load_base_text(&self, path: &RepoPath) -> BoxFuture<'_, Result<Option<String>>>;
+
     fn head_sha(&self) -> BoxFuture<'_, Option<String>> {
         async move {
             self.revparse_batch(vec!["HEAD".into()])
@@ -1801,6 +1805,19 @@ impl GitRepository for RealGitRepository {
                 Ok(shas)
             })
             .boxed()
+    }
+
+    fn load_base_text(&self, path: &RepoPath) -> BoxFuture<'_, Result<Option<String>>> {
+        let revisions = vec![format!("HEAD:{}", path.as_unix_str())];
+        let this = self;
+        async move {
+            let mut loaded = this.load_revisions(revisions).await?.into_iter();
+            match loaded.next().flatten() {
+                Some(bytes) => Ok(Some(String::from_utf8(bytes)?)),
+                None => Ok(None),
+            }
+        }
+        .boxed()
     }
 
     fn load_revisions(

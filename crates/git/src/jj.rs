@@ -193,6 +193,17 @@ impl JjRepository {
     }
 }
 
+/// Maps the outcome of `jj file show -r @- <path>` for `load_base_text`:
+/// success -> `Some(content)`, a `No such path` error -> `None`,
+/// any other error -> `Err`.
+fn map_base_text(output: Result<String>) -> Result<Option<String>> {
+    match output {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.to_string().contains("No such path") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 impl VcsRepository for JjRepository {
     fn backend_id(&self) -> &'static str {
         "jj"
@@ -303,6 +314,21 @@ impl VcsRepository for JjRepository {
             })
             .boxed()
     }
+    fn load_base_text(&self, path: &RepoPath) -> BoxFuture<'_, Result<Option<String>>> {
+        let this = self;
+        let args = vec![
+            "file".to_string(),
+            "show".to_string(),
+            "-r".to_string(),
+            "@-".to_string(),
+            path.as_unix_str().to_string(),
+        ];
+        async move {
+            map_base_text(this.run_read_only(args).await)
+        }
+        .boxed()
+    }
+
 
     fn diff_tree(&self, _request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
         // Slice A doesn't consume diff_tree; an honest error beats fake OIDs.
@@ -648,5 +674,19 @@ mod tests {
         let details = parse_show_output(output).unwrap();
         assert_eq!(details.message.as_str(), "line one\nline two");
         assert_eq!(details.commit_timestamp, 1790059323);
+    }
+    #[test]
+    fn test_map_base_text_present() {
+        let result = map_base_text(Ok("base contents".to_string()));
+        match result {
+            Ok(Some(content)) => assert_eq!(content, "base contents"),
+            other => panic!("expected Ok(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_base_text_missing_path() {
+        let output: Result<String> = Err(anyhow::anyhow!("Error: No such path: docs/notes.md"));
+        assert!(matches!(map_base_text(output), Ok(None)));
     }
 }

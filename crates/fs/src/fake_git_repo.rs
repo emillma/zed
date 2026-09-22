@@ -1207,6 +1207,10 @@ impl GitRepository for FakeGitRepository {
         future::ready(Ok(Vec::new())).boxed()
     }
 
+    fn load_base_text(&self, _path: &RepoPath) -> BoxFuture<'_, Result<Option<String>>> {
+        future::ready(Ok(None)).boxed()
+    }
+
     fn diff(&self, _diff: git::repository::DiffType) -> BoxFuture<'_, Result<String>> {
         future::ready(Ok(String::new())).boxed()
     }

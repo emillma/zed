@@ -67,6 +67,11 @@ pub trait VcsRepository: Send + Sync {
 
     /// Checks that the repository is accessible and safe to operate on.
     fn check_access(&self) -> BoxFuture<'_, Result<()>>;
+
+    /// The content of `path` at the diff base (git: HEAD; jj: the
+    /// working-copy commit's parent `@-`); `Ok(None)` if the file does not
+    /// exist at the base.
+    fn load_base_text(&self, path: &RepoPath) -> BoxFuture<'_, Result<Option<String>>>;
 }
 
 /// Any `GitRepository` backend is also a `VcsRepository`: each core method
@@ -126,5 +131,9 @@ impl<T: GitRepository + ?Sized> VcsRepository for T {
 
     fn check_access(&self) -> BoxFuture<'_, Result<()>> {
         GitRepository::check_access(self)
+    }
+
+    fn load_base_text(&self, path: &RepoPath) -> BoxFuture<'_, Result<Option<String>>> {
+        GitRepository::load_base_text(self, path)
     }
 }
