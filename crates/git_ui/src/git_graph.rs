@@ -63,7 +63,7 @@ use workspace::{
 };
 
 pub(crate) const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
-const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
+pub(crate) const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
 pub(crate) const LANE_WIDTH: Pixels = px(16.0);
 pub(crate) const LEFT_PADDING: Pixels = px(12.0);
 pub(crate) const LINE_WIDTH: Pixels = px(1.5);
@@ -804,13 +804,13 @@ enum AllCommitCount {
 }
 
 #[derive(Debug)]
-enum CurveKind {
+pub(crate) enum CurveKind {
     Merge,
     Checkout,
 }
 
 #[derive(Debug)]
-enum CommitLineSegment {
+pub(crate) enum CommitLineSegment {
     Straight {
         to_row: usize,
     },
@@ -822,19 +822,19 @@ enum CommitLineSegment {
 }
 
 #[derive(Debug)]
-struct CommitLine {
+pub(crate) struct CommitLine {
     #[cfg(test)]
     child: Oid,
     #[cfg(test)]
     parent: Oid,
-    child_column: usize,
-    full_interval: Range<usize>,
-    color_idx: usize,
-    segments: SmallVec<[CommitLineSegment; 1]>,
+    pub(crate) child_column: usize,
+    pub(crate) full_interval: Range<usize>,
+    pub(crate) color_idx: usize,
+    pub(crate) segments: SmallVec<[CommitLineSegment; 1]>,
 }
 
 impl CommitLine {
-    fn get_first_visible_segment_idx(&self, first_visible_row: usize) -> Option<(usize, usize)> {
+    pub(crate) fn get_first_visible_segment_idx(&self, first_visible_row: usize) -> Option<(usize, usize)> {
         if first_visible_row > self.full_interval.end {
             return None;
         } else if first_visible_row <= self.full_interval.start {
@@ -880,7 +880,7 @@ pub(crate) struct GraphData {
     pub(crate) commits: Vec<Rc<CommitEntry>>,
     max_commit_count: AllCommitCount,
     max_lanes: usize,
-    lines: Vec<Rc<CommitLine>>,
+    pub(crate) lines: Vec<Rc<CommitLine>>,
     active_commit_lines: HashMap<CommitLineKey, usize>,
     active_commit_lines_by_parent: HashMap<Oid, SmallVec<[usize; 1]>>,
 }
@@ -1233,7 +1233,7 @@ pub(crate) fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
     bounds.origin.x + LEFT_PADDING + lane * LANE_WIDTH + LANE_WIDTH / 2.0
 }
 
-fn to_row_center(
+pub(crate) fn to_row_center(
     to_row: usize,
     row_height: Pixels,
     scroll_offset: Pixels,
