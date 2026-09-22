@@ -301,12 +301,30 @@ impl VcsRepository for JjRepository {
         .boxed()
     }
 
-    fn show(&self, _commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
-        unimplemented!("jj backend: show not yet wired")
+    fn show(&self, commit: String) -> BoxFuture<'_, Result<CommitDetails>> {
+        let jj = self.jj_binary.clone();
+        self.executor
+            .spawn(async move {
+                let output = jj
+                    .run_read_only(&[
+                        "log",
+                        "-r",
+                        commit.as_str(),
+                        "--no-graph",
+                        "-T",
+                        SHOW_TEMPLATE,
+                    ])
+                    .await?;
+                parse_show_output(&output)
+            })
+            .boxed()
     }
 
     fn commit_data_reader(&self) -> Result<CommitDataReader> {
-        unimplemented!("jj backend: commit_data_reader not yet wired")
+        // A git-object-shaped reader would need a separate backend path; slice A never consumes it.
+        Err(anyhow::anyhow!(
+            "jj backend: commit data reader not yet supported (git-object-shaped; slice A does not consume it)"
+        ))
     }
 
     fn default_branch(
@@ -328,6 +346,28 @@ impl VcsRepository for JjRepository {
             })
             .boxed()
     }
+}
+
+/// `show` template: sha, description, committer epoch, author name, and author
+/// email, joined by the literal separator `|JJSEP|` - a description containing the
+/// separator would misparse.
+const SHOW_TEMPLATE: &str = "commit_id ++ \"|JJSEP|\" ++ description ++ \"|JJSEP|\" ++ committer.timestamp().format(\"%s\") ++ \"|JJSEP|\" ++ author.name() ++ \"|JJSEP|\" ++ author.email()";
+
+/// Parses `show` template output (sha, description, committer epoch, author name,
+/// author email) into CommitDetails.
+fn parse_show_output(output: &str) -> Result<CommitDetails> {
+    const SEP: &str = "|JJSEP|";
+    let fields: Vec<&str> = output.split(SEP).collect();
+    if fields.len() < 5 {
+        return Err(anyhow::anyhow!("jj backend: malformed show output: {output:?}"));
+    }
+    Ok(CommitDetails {
+        sha: fields[0].trim().into(),
+        message: fields[1].trim_end().into(),
+        commit_timestamp: fields[2].trim().parse::<i64>().unwrap_or(0),
+        author_name: fields[3].trim().into(),
+        author_email: fields[4].trim().into(),
+    })
 }
 
 /// Parses `jj bookmark list` output into branches. A bookmark line
@@ -576,5 +616,24 @@ mod tests {
                 jj_tracked(StatusCode::Added)
             )])
         );
+    }
+
+    #[test]
+    fn test_parse_show_output() {
+        let output = "0123456789abcdef0123456789abcdef012345|JJSEP|fix the thing|JJSEP|1790059323|JJSEP|Emil Martens|JJSEP|emil.martens@gmail.com";
+        let details = parse_show_output(output).unwrap();
+        assert_eq!(details.sha.as_str(), "0123456789abcdef0123456789abcdef012345");
+        assert_eq!(details.message.as_str(), "fix the thing");
+        assert_eq!(details.commit_timestamp, 1790059323);
+        assert_eq!(details.author_name.as_str(), "Emil Martens");
+        assert_eq!(details.author_email.as_str(), "emil.martens@gmail.com");
+    }
+
+    #[test]
+    fn test_parse_show_output_multi_line_description() {
+        let output = "0123456789abcdef0123456789abcdef012345|JJSEP|line one\nline two\n|JJSEP|1790059323|JJSEP|Emil Martens|JJSEP|emil.martens@gmail.com";
+        let details = parse_show_output(output).unwrap();
+        assert_eq!(details.message.as_str(), "line one\nline two");
+        assert_eq!(details.commit_timestamp, 1790059323);
     }
 }
