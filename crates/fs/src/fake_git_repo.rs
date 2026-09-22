@@ -512,6 +512,7 @@ impl GitRepository for FakeGitRepository {
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             anyhow::Ok(GitStatus {
                 entries: entries.into(),
+                conflicts: Vec::new(),
             })
         });
         Task::ready(match result {

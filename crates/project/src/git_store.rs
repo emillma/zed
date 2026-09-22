@@ -12697,9 +12697,14 @@ async fn compute_snapshot(
         .map(|(p, s)| (p, *s))
         .collect();
     let mut conflicted_paths = Vec::new();
+    // The jj backend reports conflicted paths separately from its status
+    // entries; the git backend always leaves this list empty.
+    for repo_path in &statuses.conflicts {
+        conflicted_paths.push(repo_path.clone());
+    }
     let statuses_by_path = SumTree::from_iter(
         statuses.entries.iter().map(|(repo_path, status)| {
-            if status.is_conflicted() {
+            if status.is_conflicted() && !conflicted_paths.contains(repo_path) {
                 conflicted_paths.push(repo_path.clone());
             }
             StatusEntry {

@@ -16,6 +16,51 @@ mod conflict_set_tests {
     use util::{path, rel_path::rel_path};
 
     #[test]
+    fn test_parse_jj_conflict_markers() {
+        let test_content = r#"
+            This is some text before the conflict.
+            <<<<<<< conflict 1 of 1
+            %%%%%%% diff from: aaaaaa bbbbbb "desc1"
+            \\\\\\        to: cccccc dddddd "desc2"
+            -more
+            +AAA
+            +++++++ eeeeee ffffff "desc3"
+            BBB
+            >>>>>>> conflict 1 of 1 ends
+            Text after the conflict.
+        "#
+        .unindent();
+
+        let buffer_id = BufferId::new(2).unwrap();
+        let buffer = Buffer::new(ReplicaId::LOCAL, buffer_id, &test_content);
+        let snapshot = buffer.snapshot();
+
+        let conflict_snapshot = ConflictSet::parse(&snapshot);
+        assert_eq!(conflict_snapshot.conflicts.len(), 1);
+
+        let conflict = &conflict_snapshot.conflicts[0];
+        assert_eq!(conflict.ours_branch_name.as_ref(), "ours");
+        assert_eq!(conflict.theirs_branch_name.as_ref(), "theirs");
+        assert!(conflict.base.is_none());
+
+        let expected_start = test_content.find("<<<<<<< conflict").unwrap();
+        let expected_end = test_content.find(">>>>>>> conflict").unwrap()
+            + ">>>>>>> conflict 1 of 1 ends\n".len();
+        assert_eq!(
+            (
+                conflict.range.start.to_offset(&snapshot),
+                conflict.range.end.to_offset(&snapshot),
+            ),
+            (expected_start, expected_end)
+        );
+        let conflict_text = snapshot
+            .text_for_range(conflict.range.clone())
+            .collect::<String>();
+        assert!(conflict_text.starts_with("<<<<<<< conflict 1 of 1\n"));
+        assert!(conflict_text.ends_with(">>>>>>> conflict 1 of 1 ends\n"));
+    }
+
+    #[test]
     fn test_parse_conflicts_in_buffer() {
         // Create a buffer with conflict markers
         let test_content = r#"

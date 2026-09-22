@@ -179,6 +179,7 @@ impl ConflictSet {
         let mut lines = buffer.text_for_range(0..buffer_len).lines();
 
         let mut conflict_start: Option<usize> = None;
+        let mut jj_conflict_start: Option<usize> = None;
         let mut ours_start: Option<usize> = None;
         let mut ours_end: Option<usize> = None;
         let mut ours_branch_name: Option<SharedString> = None;
@@ -190,7 +191,28 @@ impl ConflictSet {
         while let Some(line) = lines.next() {
             let line_end = line_pos + line.len();
 
-            if let Some(branch_name) = line.strip_prefix("<<<<<<< ") {
+            if line.starts_with("<<<<<<< conflict ") {
+                // jj conflict blocks have their own marker lines and no
+                // ours/theirs split: record the whole block as one region.
+                jj_conflict_start = Some(line_pos);
+            } else if let Some(end_marker) = line.strip_prefix(">>>>>>> ")
+                && jj_conflict_start.is_some()
+                && end_marker.starts_with("conflict ")
+                && end_marker.ends_with(" ends")
+            {
+                let conflict_end = (line_end + 1).min(buffer_len);
+                let region = buffer.anchor_after(jj_conflict_start.unwrap())
+                    ..buffer.anchor_before(conflict_end);
+                conflicts.push(ConflictRegion {
+                    ours_branch_name: SharedString::new_static("ours"),
+                    theirs_branch_name: SharedString::new_static("theirs"),
+                    range: region.clone(),
+                    ours: region.clone(),
+                    theirs: region,
+                    base: None,
+                });
+                jj_conflict_start = None;
+            } else if let Some(branch_name) = line.strip_prefix("<<<<<<< ") {
                 // If we see a new conflict marker while already parsing one,
                 // abandon the previous one and start a new one
                 conflict_start = Some(line_pos);
