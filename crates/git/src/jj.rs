@@ -12,6 +12,7 @@ use collections::HashMap;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use gpui::{BackgroundExecutor, SharedString, Task};
+use serde::Deserialize;
 use thiserror::Error;
 use util::command::{Command, new_command};
 
@@ -256,17 +257,60 @@ impl JjRepository {
     }
 }
 
+/// State flags for a `jj log` revision, computed in jj with jj's own
+/// semantics. `json`/`stringify` strip jj's color labels, so all styling is
+/// carried by these booleans and mapped to theme colors in the `jj_log`
+/// renderer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JjLogFlags {
+    /// The working copy (`@`).
+    pub working_copy: bool,
+    /// The repository's root commit.
+    pub root: bool,
+    /// Its change id holds more than one commit (after a rebase).
+    pub divergent: bool,
+    /// Hidden from `jj log` by default (e.g. abandoned).
+    pub hidden: bool,
+    /// The commit has a file conflict.
+    pub conflict: bool,
+    /// The commit has no diff against its first parent.
+    pub empty: bool,
+    /// The commit is at or under an immutable boundary.
+    pub immutable: bool,
+    /// Authored by the current user.
+    pub mine: bool,
+    /// An ancestor of the working copy.
+    pub ancestor_of_wc: bool,
+    /// A descendant of the working copy.
+    pub descendant_of_wc: bool,
+}
+
 /// A single `jj log` revision, for the history panel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JjLogEntry {
     pub change_id: SharedString,
     pub commit_id: SharedString,
+    /// Commit ids of the direct parents — these key the lane graph's lanes.
     pub parents: Vec<SharedString>,
+    /// Change ids of the direct parents — stable across rebase; the edges
+    /// `jj log --graph` draws between revisions.
+    pub parent_change_ids: Vec<SharedString>,
+    /// Bookmarks in display form (`name` or `name@remote`).
     pub bookmarks: Vec<SharedString>,
+    pub tags: Vec<SharedString>,
     pub description: SharedString,
     pub author_name: SharedString,
     pub author_email: SharedString,
+    /// The committer timestamp, as Unix seconds.
     pub commit_timestamp: i64,
+    pub flags: JjLogFlags,
+    /// A merge: more than one parent commit.
+    pub is_merge: bool,
+    /// No other emitted revision lists this one as a parent.
+    pub is_head: bool,
+    /// Distance to the nearest emitted head (`0` for a head); `None` when the
+    /// branch continues outside the emitted window.
+    pub dist_to_head: Option<u32>,
 }
 
 /// Maps the outcome of `jj file show -r @- <path>` for `load_base_text`:
@@ -463,9 +507,13 @@ impl VcsRepository for JjRepository {
 /// separator would misparse.
 const SHOW_TEMPLATE: &str = "commit_id ++ \"|JJSEP|\" ++ description ++ \"|JJSEP|\" ++ committer.timestamp().format(\"%s\") ++ \"|JJSEP|\" ++ author.name() ++ \"|JJSEP|\" ++ author.email()";
 
-/// `jj log` template: one row per revision, `|JJSEP|`-separated fields,
-/// each row terminated by `"\n"` (without it, rows concatenate).
-const LOG_TEMPLATE: &str = "change_id.short() ++ \"|JJSEP|\" ++ commit_id ++ \"|JJSEP|\" ++ parents.map(|p| p.commit_id()).join(\" \") ++ \"|JJSEP|\" ++ bookmarks.join(\",\") ++ \"|JJSEP|\" ++ description.first_line() ++ \"|JJSEP|\" ++ author.name() ++ \"|JJSEP|\" ++ author.email() ++ \"|JJSEP|\" ++ committer.timestamp().format(\"%s\") ++ \"\\n\"";
+/// `jj log` template: one JSON object per revision (JSONL). `json(self)`
+/// carries the full commit (commit_id, parent commit ids, change_id,
+/// description, author/committer); the trailing fields add change-id edges
+/// (stable across rebase), display-form bookmarks, tags, and the styling
+/// flags. `json`/`stringify` strip jj's color labels, so all styling is
+/// carried by the boolean flags. Mirrors Emil's `jjlog_graph.py` `TPL`.
+const LOG_TEMPLATE: &str = r#"'{"commit":' ++ json(self) ++ ',"parent_change_ids":[' ++ parents.map(|p| json(p.change_id())).join(",") ++ '],"bookmarks":[' ++ bookmarks.map(|b| stringify(b.name() ++ if(b.remote(), "@" ++ b.remote(), "")).escape_json()).join(",") ++ '],"tags":[' ++ tags.map(|t| json(t.name())).join(",") ++ '],"flags":{"working_copy":' ++ current_working_copy ++ ',"root":' ++ root ++ ',"divergent":' ++ divergent ++ ',"hidden":' ++ hidden ++ ',"conflict":' ++ conflict ++ ',"empty":' ++ empty ++ ',"immutable":' ++ immutable ++ ',"mine":' ++ mine ++ ',"ancestor_of_wc":' ++ self.contained_in("ancestors(@)") ++ ',"descendant_of_wc":' ++ self.contained_in("descendants(@)") ++ '}}' ++ "\n""#;
 
 /// Parses `show` template output (sha, description, committer epoch, author name,
 /// author email) into CommitDetails.
@@ -486,39 +534,191 @@ fn parse_show_output(output: &str) -> Result<CommitDetails> {
     })
 }
 
-/// Parses `jj log` template output into log entries, skipping empty or
-/// malformed rows.
+/// Parses `jj log` JSONL output (one JSON object per revision, see
+/// `LOG_TEMPLATE`) into log entries. Empty and malformed lines are skipped
+/// so a single bad row never fails the batch; the head metrics are then
+/// computed over the surviving entries.
 fn parse_log_output(output: &str) -> Vec<JjLogEntry> {
-    const SEP: &str = "|JJSEP|";
-    output
+    let mut entries = output
         .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split(SEP).collect();
-            if fields.len() < 8 {
-                return None;
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<LogLine>(line).ok())
+        .map(log_line_to_entry)
+        .collect::<Vec<_>>();
+    compute_head_metrics(&mut entries);
+    entries
+}
+
+/// The `json(self)` commit object embedded in each `LOG_TEMPLATE` line.
+#[derive(Deserialize)]
+struct LogLineCommit {
+    commit_id: String,
+    #[serde(default)]
+    parents: Vec<String>,
+    change_id: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    author: LogLineActor,
+    #[serde(default)]
+    committer: LogLineActor,
+}
+
+#[derive(Deserialize, Default)]
+struct LogLineActor {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    timestamp: String,
+}
+
+/// The `flags` object in each `LOG_TEMPLATE` line (see `JjLogFlags`).
+#[derive(Deserialize, Default)]
+struct LogLineFlags {
+    #[serde(default)]
+    working_copy: bool,
+    #[serde(default)]
+    root: bool,
+    #[serde(default)]
+    divergent: bool,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    conflict: bool,
+    #[serde(default)]
+    empty: bool,
+    #[serde(default)]
+    immutable: bool,
+    #[serde(default)]
+    mine: bool,
+    #[serde(default)]
+    ancestor_of_wc: bool,
+    #[serde(default)]
+    descendant_of_wc: bool,
+}
+
+/// One `jj log` JSONL line (see `LOG_TEMPLATE`).
+#[derive(Deserialize)]
+struct LogLine {
+    commit: LogLineCommit,
+    #[serde(default)]
+    parent_change_ids: Vec<String>,
+    #[serde(default)]
+    bookmarks: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    flags: LogLineFlags,
+}
+
+/// Converts a parsed `LOG_TEMPLATE` line into a `JjLogEntry`. The head
+/// metrics (`is_head`, `dist_to_head`) are left as placeholders and filled in
+/// by `compute_head_metrics`.
+fn log_line_to_entry(line: LogLine) -> JjLogEntry {
+    let commit = line.commit;
+    let flags = line.flags;
+    JjLogEntry {
+        change_id: commit.change_id.into(),
+        commit_id: commit.commit_id.into(),
+        parents: commit.parents.iter().map(SharedString::from).collect(),
+        parent_change_ids: line
+            .parent_change_ids
+            .iter()
+            .map(SharedString::from)
+            .collect(),
+        bookmarks: line.bookmarks.iter().map(SharedString::from).collect(),
+        tags: line.tags.iter().map(SharedString::from).collect(),
+        description: commit.description.into(),
+        author_name: commit.author.name.into(),
+        author_email: commit.author.email.into(),
+        commit_timestamp: parse_rfc3339_to_epoch(&commit.committer.timestamp),
+        flags: JjLogFlags {
+            working_copy: flags.working_copy,
+            root: flags.root,
+            divergent: flags.divergent,
+            hidden: flags.hidden,
+            conflict: flags.conflict,
+            empty: flags.empty,
+            immutable: flags.immutable,
+            mine: flags.mine,
+            ancestor_of_wc: flags.ancestor_of_wc,
+            descendant_of_wc: flags.descendant_of_wc,
+        },
+        is_merge: commit.parents.len() > 1,
+        is_head: false,
+        dist_to_head: None,
+    }
+}
+
+/// Parses an RFC-3339 timestamp (jj's `json(self)` actor timestamp, e.g.
+/// `2026-09-23T22:55:31+02:00`) into Unix seconds; `0` on failure, matching
+/// the old template's epoch handling.
+fn parse_rfc3339_to_epoch(timestamp: &str) -> i64 {
+    time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
+        .map(|dt| dt.unix_timestamp())
+        .unwrap_or(0)
+}
+
+/// Computes `is_head` and `dist_to_head` over the emitted revisions. A
+/// revision is a head when no other emitted revision lists it in its
+/// `parent_change_ids`; `dist_to_head` is `0` for a head, otherwise `1 +` the
+/// minimum over its emitted children (or `None` when no child reaches a head,
+/// i.e. the branch continues outside the emitted window). Exact when the
+/// emitted set is ancestor-closed (a plain `log` near the top, or a closed
+/// revset); best-effort under `-n` truncation.
+fn compute_head_metrics(entries: &mut [JjLogEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    let index: HashMap<SharedString, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| (entry.change_id.clone(), i))
+        .collect();
+    // Children of `i`: the revisions that list `i` as a parent (by change id).
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
+    for (child, entry) in entries.iter().enumerate() {
+        for parent_change_id in &entry.parent_change_ids {
+            if let Some(&parent) = index.get(parent_change_id) {
+                children[parent].push(child);
             }
-            Some(JjLogEntry {
-                change_id: fields[0].trim().into(),
-                commit_id: fields[1].trim().into(),
-                parents: fields[2]
-                    .split(' ')
-                    .map(str::trim)
-                    .filter(|parent| !parent.is_empty())
-                    .map(SharedString::from)
-                    .collect(),
-                bookmarks: fields[3]
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|bookmark| !bookmark.is_empty())
-                    .map(SharedString::from)
-                    .collect(),
-                description: fields[4].trim_end().into(),
-                author_name: fields[5].trim().into(),
-                author_email: fields[6].trim().into(),
-                commit_timestamp: fields[7].trim().parse::<i64>().unwrap_or(0),
-            })
-        })
-        .collect()
+        }
+    }
+    let is_head: Vec<bool> = (0..entries.len()).map(|i| children[i].is_empty()).collect();
+
+    let mut computed = vec![false; entries.len()];
+    let mut distance: Vec<Option<u32>> = vec![None; entries.len()];
+    for (i, entry) in entries.iter_mut().enumerate() {
+        entry.is_head = is_head[i];
+        entry.dist_to_head = head_distance(i, &children, &is_head, &mut computed, &mut distance);
+    }
+}
+
+/// Distance from revision `i` to its nearest head (see `compute_head_metrics`),
+/// memoized in `computed`/`distance`.
+fn head_distance(
+    i: usize,
+    children: &[Vec<usize>],
+    is_head: &[bool],
+    computed: &mut [bool],
+    distance: &mut [Option<u32>],
+) -> Option<u32> {
+    if computed[i] {
+        return distance[i];
+    }
+    computed[i] = true;
+    distance[i] = if is_head[i] {
+        Some(0)
+    } else {
+        children[i]
+            .iter()
+            .filter_map(|&child| head_distance(child, children, is_head, computed, distance))
+            .min()
+            .map(|d| d.saturating_add(1))
+    };
+    distance[i]
 }
 
 /// Parses `jj config list revset-aliases` output into `(name, expansion)`
@@ -914,18 +1114,28 @@ mod tests {
         assert_eq!(details.message.as_str(), "line one\nline two");
         assert_eq!(details.commit_timestamp, 1790059323);
     }
+    /// One `LOG_TEMPLATE` line: a working-copy merge whose second parent's
+    /// change id falls outside the emitted window.
+    const LOG_LINE_MERGE_HEAD: &str = r#"{"commit":{"commit_id":"0123456789abcdef0123456789abcdef01234567","parents":["1111111111111111111111111111111111111111","2222222222222222222222222222222222222222"],"change_id":"aaaabbbbccccdddd","description":"merge side branch\nwith body","author":{"name":"Emil Martens","email":"emil@example.com","timestamp":"2026-01-05T10:00:00Z"},"committer":{"name":"Emil Martens","email":"emil@example.com","timestamp":"2026-01-05T10:00:00Z"}},"parent_change_ids":["bbbbaaaaccccddee","fff0fff0fff0fff0"],"bookmarks":["main@origin"],"tags":[],"flags":{"working_copy":true,"root":false,"divergent":false,"hidden":false,"conflict":true,"empty":false,"immutable":true,"mine":true,"ancestor_of_wc":false,"descendant_of_wc":false}}"#;
+
+    const LOG_LINE_LINEAR: &str = r#"{"commit":{"commit_id":"9876543210fedc9876543210fedc9876543210","parents":["4141414141414141414141414141414141414141"],"change_id":"bbbbaaaaccccddee","description":"linear child","author":{"name":"Ana Torres","email":"ana@example.com","timestamp":"2025-06-01T02:00:00+02:00"},"committer":{"name":"Ana Torres","email":"ana@example.com","timestamp":"2025-06-01T02:00:00+02:00"}},"parent_change_ids":["ccccdddd00001111"],"bookmarks":["dev"],"tags":[],"flags":{"working_copy":false,"root":false,"divergent":false,"hidden":false,"conflict":false,"empty":false,"immutable":false,"mine":false,"ancestor_of_wc":true,"descendant_of_wc":false}}"#;
+
+    const LOG_LINE_OLDEST: &str = r#"{"commit":{"commit_id":"4141414141414141414141414141414141414141","parents":[],"change_id":"ccccdddd00001111","description":"","author":{"name":"Bob Lee","email":"bob@example.com","timestamp":"2025-02-01T00:00:00Z"},"committer":{"name":"Bob Lee","email":"bob@example.com","timestamp":"2025-02-01T00:00:00Z"}},"parent_change_ids":[],"bookmarks":[],"tags":["release-1.0"],"flags":{"working_copy":false,"root":true,"divergent":false,"hidden":false,"conflict":false,"empty":false,"immutable":false,"mine":false,"ancestor_of_wc":true,"descendant_of_wc":false}}"#;
+
     #[test]
     fn test_parse_log_output_multi_row() {
-        const OUTPUT: &str = concat!(
-            "abc123def456|JJSEP|0123456789abcdef0123456789abcdef|JJSEP|1111111111111111111111111111111111111111 2222222222222222222222222222222222222222|JJSEP|main*,feature|JJSEP|fix the thing|JJSEP|Emil Martens|JJSEP|emil@example.com|JJSEP|1790059323\n",
-            "789fedcba654|JJSEP|9876543210fedc9876543210fedc9876|JJSEP||JJSEP||JJSEP||JJSEP|Ana Torres|JJSEP|ana@example.com|JJSEP|1790059000\n"
-        );
-        let entries = parse_log_output(OUTPUT);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].change_id, SharedString::from("abc123def456"));
+        // Newest first, like `jj log`: a merge head, a linear child, and the
+        // oldest emitted revision (its parent is truncated away, so its
+        // `parent_change_ids` is empty even though it is not a head).
+        let output =
+            LOG_LINE_MERGE_HEAD.to_owned() + "\n" + LOG_LINE_LINEAR + "\n" + LOG_LINE_OLDEST;
+        let entries = parse_log_output(&output);
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(entries[0].change_id, SharedString::from("aaaabbbbccccdddd"));
         assert_eq!(
             entries[0].commit_id,
-            SharedString::from("0123456789abcdef0123456789abcdef")
+            SharedString::from("0123456789abcdef0123456789abcdef01234567")
         );
         assert_eq!(
             entries[0].parents,
@@ -934,37 +1144,75 @@ mod tests {
                 SharedString::from("2222222222222222222222222222222222222222"),
             ]
         );
-        assert!(entries[1].parents.is_empty());
+        assert_eq!(
+            entries[0].parent_change_ids,
+            vec![
+                SharedString::from("bbbbaaaaccccddee"),
+                SharedString::from("fff0fff0fff0fff0"),
+            ]
+        );
+        assert!(entries[0].is_merge);
+        assert!(entries[0].is_head);
+        assert_eq!(entries[0].dist_to_head, Some(0));
         assert_eq!(
             entries[0].bookmarks,
-            vec![SharedString::from("main*"), SharedString::from("feature")]
+            vec![SharedString::from("main@origin")]
         );
-        assert_eq!(entries[0].description, SharedString::from("fix the thing"));
-        assert_eq!(entries[0].author_name, SharedString::from("Emil Martens"));
         assert_eq!(
-            entries[0].author_email,
-            SharedString::from("emil@example.com")
+            entries[0].description,
+            SharedString::from("merge side branch\nwith body")
         );
-        assert_eq!(entries[0].commit_timestamp, 1790059323);
-        assert!(entries[1].bookmarks.is_empty());
-        assert_eq!(entries[1].description, SharedString::from(""));
-        assert_eq!(entries[1].commit_timestamp, 1790059000);
+        assert_eq!(entries[0].author_name, SharedString::from("Emil Martens"));
+        assert_eq!(entries[0].commit_timestamp, 1767607200);
+        let flags = &entries[0].flags;
+        assert!(
+            flags.working_copy && flags.conflict && flags.immutable && flags.mine,
+            "expected working_copy, conflict, immutable, and mine flags"
+        );
+        assert!(!flags.root && !flags.divergent && !flags.hidden && !flags.empty);
+
+        assert_eq!(entries[1].change_id, SharedString::from("bbbbaaaaccccddee"));
+        assert_eq!(
+            entries[1].parent_change_ids,
+            vec![SharedString::from("ccccdddd00001111")]
+        );
+        assert!(!entries[1].is_merge);
+        assert!(!entries[1].is_head);
+        assert_eq!(entries[1].dist_to_head, Some(1));
+        assert_eq!(entries[1].bookmarks, vec![SharedString::from("dev")]);
+        assert_eq!(entries[1].description, SharedString::from("linear child"));
+        // `+02:00` offsets normalize to the same epoch as `2025-06-01T00:00:00Z`.
+        assert_eq!(entries[1].commit_timestamp, 1748736000);
+        assert!(entries[1].flags.ancestor_of_wc && !entries[1].flags.working_copy);
+
+        assert_eq!(entries[2].change_id, SharedString::from("ccccdddd00001111"));
+        assert!(entries[2].parents.is_empty());
+        assert!(entries[2].parent_change_ids.is_empty());
+        assert!(!entries[2].is_head);
+        assert_eq!(entries[2].dist_to_head, Some(2));
+        assert_eq!(entries[2].tags, vec![SharedString::from("release-1.0")]);
+        assert_eq!(entries[2].commit_timestamp, 1738368000);
+        assert!(entries[2].flags.root && entries[2].flags.ancestor_of_wc);
     }
 
     #[test]
     fn test_parse_log_output_single_row() {
-        let entries = parse_log_output(
-            "abc123def456|JJSEP|0123|JJSEP|3333333333333333333333333333333333333333|JJSEP|main*|JJSEP|hello|JJSEP|Bob|JJSEP|bob@example.com|JJSEP|123",
-        );
+        const OUTPUT: &str = r#"{"commit":{"commit_id":"0123","parents":[],"change_id":"abc123def456","description":"hello","author":{"name":"Bob","email":"bob@example.com","timestamp":"2024-01-01T00:00:00Z"},"committer":{"name":"Bob","email":"bob@example.com","timestamp":"2024-01-01T00:00:00Z"}},"parent_change_ids":[],"bookmarks":["main*"],"tags":[],"flags":{"working_copy":false,"root":false,"divergent":false,"hidden":false,"conflict":false,"empty":false,"immutable":false,"mine":false,"ancestor_of_wc":false,"descendant_of_wc":false}}"#;
+        let entries = parse_log_output(OUTPUT);
         assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].parents,
-            vec![SharedString::from(
-                "3333333333333333333333333333333333333333"
-            )]
-        );
+        assert!(entries[0].parents.is_empty());
+        assert!(entries[0].is_head);
+        assert_eq!(entries[0].dist_to_head, Some(0));
         assert_eq!(entries[0].bookmarks, vec![SharedString::from("main*")]);
-        assert_eq!(entries[0].commit_timestamp, 123);
+        assert_eq!(entries[0].commit_timestamp, 1704067200);
+    }
+
+    #[test]
+    fn test_parse_log_output_skips_malformed_lines() {
+        let output = "this is not json\n".to_owned() + LOG_LINE_LINEAR;
+        let entries = parse_log_output(&output);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].change_id, SharedString::from("bbbbaaaaccccddee"));
     }
 
     #[test]
