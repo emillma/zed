@@ -10,10 +10,10 @@ pub mod vcs;
 
 pub use crate::hosting_provider::*;
 pub use crate::remote::*;
+pub use crate::vcs::VcsRepository;
 use anyhow::Result;
 use gpui::{Action, actions};
 pub use repository::RemoteCommandOutput;
-pub use crate::vcs::VcsRepository;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Write as _};

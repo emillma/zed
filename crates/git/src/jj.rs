@@ -9,8 +9,8 @@ use crate::status::{
 use crate::vcs::VcsRepository;
 use anyhow::Result;
 use collections::HashMap;
-use futures::future::BoxFuture;
 use futures::FutureExt as _;
+use futures::future::BoxFuture;
 use gpui::{BackgroundExecutor, SharedString, Task};
 use thiserror::Error;
 use util::command::{Command, new_command};
@@ -237,6 +237,23 @@ impl JjRepository {
             })
             .boxed()
     }
+
+    /// Returns the revset aliases defined in jj's config layers (user,
+    /// repo, workspace — merged, as jj itself sees them) as
+    /// `(name, expansion)` pairs. jj has no dedicated saved-revsets store;
+    /// `[revset-aliases]` config entries are its native named-revset
+    /// mechanism, so the history panel's dropdown offers these.
+    pub fn revset_aliases(&self) -> BoxFuture<'_, Result<Vec<(SharedString, SharedString)>>> {
+        let jj = self.jj_binary.clone();
+        self.executor
+            .spawn(async move {
+                let args: Vec<String> =
+                    vec!["config".into(), "list".into(), "revset-aliases".into()];
+                let output = jj.run_read_only(&args).await?;
+                Ok(parse_revset_aliases(&output))
+            })
+            .boxed()
+    }
 }
 
 /// A single `jj log` revision, for the history panel.
@@ -277,11 +294,7 @@ impl VcsRepository for JjRepository {
                     .await
                     .ok()?;
                 let sha = output.trim().to_string();
-                if sha.is_empty() {
-                    None
-                } else {
-                    Some(sha)
-                }
+                if sha.is_empty() { None } else { Some(sha) }
             })
             .boxed()
     }
@@ -382,12 +395,8 @@ impl VcsRepository for JjRepository {
             "@-".to_string(),
             path.as_unix_str().to_string(),
         ];
-        async move {
-            map_base_text(this.run_read_only(args).await)
-        }
-        .boxed()
+        async move { map_base_text(this.run_read_only(args).await) }.boxed()
     }
-
 
     fn diff_tree(&self, _request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
         // Slice A doesn't consume diff_tree; an honest error beats fake OIDs.
@@ -436,7 +445,10 @@ impl VcsRepository for JjRepository {
                 let output = jj.run_read_only(&["bookmark", "list"]).await?;
                 let branches = parse_bookmarks(&output, "");
                 for name in ["trunk", "main", "master"] {
-                    if branches.iter().any(|branch| branch.ref_name.as_str() == name) {
+                    if branches
+                        .iter()
+                        .any(|branch| branch.ref_name.as_str() == name)
+                    {
                         return Ok(Some(name.into()));
                     }
                 }
@@ -461,7 +473,9 @@ fn parse_show_output(output: &str) -> Result<CommitDetails> {
     const SEP: &str = "|JJSEP|";
     let fields: Vec<&str> = output.split(SEP).collect();
     if fields.len() < 5 {
-        return Err(anyhow::anyhow!("jj backend: malformed show output: {output:?}"));
+        return Err(anyhow::anyhow!(
+            "jj backend: malformed show output: {output:?}"
+        ));
     }
     Ok(CommitDetails {
         sha: fields[0].trim().into(),
@@ -505,6 +519,57 @@ fn parse_log_output(output: &str) -> Vec<JjLogEntry> {
             })
         })
         .collect()
+}
+
+/// Parses `jj config list revset-aliases` output into `(name, expansion)`
+/// pairs. Lines look like `revset-aliases."trunk()" = "master@origin"` or
+/// `revset-aliases.all-local = "all()"`; malformed lines are skipped.
+fn parse_revset_aliases(output: &str) -> Vec<(SharedString, SharedString)> {
+    const PREFIX: &str = "revset-aliases.";
+    output
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(" = ")?;
+            let name = unquote_toml_string(key.strip_prefix(PREFIX)?)?;
+            let expansion = unquote_toml_string(value.trim())?;
+            Some((SharedString::from(name), SharedString::from(expansion)))
+        })
+        .collect()
+}
+
+/// Unquotes a TOML basic-string rendering (`"..."`) or passes a bare key
+/// through, unescaping the common escapes. Returns `None` for anything that
+/// is neither.
+fn unquote_toml_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
+        // Bare TOML keys (letters, digits, dashes) pass through unquoted.
+        return (!value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .then(|| value.to_string());
+    };
+    let mut result = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            result.push(c);
+            continue;
+        }
+        match chars.next()? {
+            'n' => result.push('\n'),
+            't' => result.push('\t'),
+            'r' => result.push('\r'),
+            '"' => result.push('"'),
+            '\\' => result.push('\\'),
+            other => {
+                result.push('\\');
+                result.push(other);
+            }
+        }
+    }
+    Some(result)
 }
 
 /// Parses `jj bookmark list` output into branches. A bookmark line
@@ -665,8 +730,8 @@ fn parse_jj_status(output: &str, path_prefixes: &[RepoPath]) -> Result<GitStatus
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
+    use std::sync::Arc;
 
     const BOOKMARK_LIST_OUTPUT: &str = concat!(
         "b2: lpuuqymm 9193e9e5 line1|pipe\n",
@@ -694,10 +759,17 @@ mod tests {
         assert_eq!(upstream.ref_name.as_str(), "refs/remotes/origin/main");
         assert_eq!(
             upstream.tracking,
-            UpstreamTrackingStatus { ahead: 1, behind: 2 }.into()
+            UpstreamTrackingStatus {
+                ahead: 1,
+                behind: 2
+            }
+            .into()
         );
         assert_eq!(
-            branches.iter().filter(|branch| branch.upstream.is_some()).count(),
+            branches
+                .iter()
+                .filter(|branch| branch.upstream.is_some())
+                .count(),
             1
         );
         assert!(branches[5].is_head); // trunk holds @
@@ -721,7 +793,6 @@ mod tests {
         assert!(!branches.is_empty());
         assert!(branches.iter().all(|branch| !branch.is_head));
     }
-
 
     const JJ_STATUS_OUTPUT: &str = concat!(
         "Working copy changes:\n",
@@ -754,12 +825,24 @@ mod tests {
                         second_head: UnmergedStatusCode::Updated,
                     })
                 ),
-                (RepoPath::new("f.txt").unwrap(), jj_tracked(StatusCode::Added)),
-                (RepoPath::new("g.txt").unwrap(), jj_tracked(StatusCode::Added)),
-                (RepoPath::new("h.txt").unwrap(), jj_tracked(StatusCode::Added)),
+                (
+                    RepoPath::new("f.txt").unwrap(),
+                    jj_tracked(StatusCode::Added)
+                ),
+                (
+                    RepoPath::new("g.txt").unwrap(),
+                    jj_tracked(StatusCode::Added)
+                ),
+                (
+                    RepoPath::new("h.txt").unwrap(),
+                    jj_tracked(StatusCode::Added)
+                ),
             ])
         );
-        assert_eq!(status.conflicts, vec![RepoPath::new("conflicted.txt").unwrap()]);
+        assert_eq!(
+            status.conflicts,
+            vec![RepoPath::new("conflicted.txt").unwrap()]
+        );
     }
 
     #[test]
@@ -775,9 +858,18 @@ mod tests {
         assert_eq!(
             status.entries,
             Arc::from([
-                (RepoPath::new("a.txt").unwrap(), jj_tracked(StatusCode::Modified)),
-                (RepoPath::new("b.txt").unwrap(), jj_tracked(StatusCode::Deleted)),
-                (RepoPath::new("c.txt").unwrap(), jj_tracked(StatusCode::Renamed)),
+                (
+                    RepoPath::new("a.txt").unwrap(),
+                    jj_tracked(StatusCode::Modified)
+                ),
+                (
+                    RepoPath::new("b.txt").unwrap(),
+                    jj_tracked(StatusCode::Deleted)
+                ),
+                (
+                    RepoPath::new("c.txt").unwrap(),
+                    jj_tracked(StatusCode::Renamed)
+                ),
             ])
         );
     }
@@ -805,7 +897,10 @@ mod tests {
     fn test_parse_show_output() {
         let output = "0123456789abcdef0123456789abcdef012345|JJSEP|fix the thing|JJSEP|1790059323|JJSEP|Emil Martens|JJSEP|emil.martens@gmail.com";
         let details = parse_show_output(output).unwrap();
-        assert_eq!(details.sha.as_str(), "0123456789abcdef0123456789abcdef012345");
+        assert_eq!(
+            details.sha.as_str(),
+            "0123456789abcdef0123456789abcdef012345"
+        );
         assert_eq!(details.message.as_str(), "fix the thing");
         assert_eq!(details.commit_timestamp, 1790059323);
         assert_eq!(details.author_name.as_str(), "Emil Martens");
@@ -828,7 +923,10 @@ mod tests {
         let entries = parse_log_output(OUTPUT);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].change_id, SharedString::from("abc123def456"));
-        assert_eq!(entries[0].commit_id, SharedString::from("0123456789abcdef0123456789abcdef"));
+        assert_eq!(
+            entries[0].commit_id,
+            SharedString::from("0123456789abcdef0123456789abcdef")
+        );
         assert_eq!(
             entries[0].parents,
             vec![
@@ -843,7 +941,10 @@ mod tests {
         );
         assert_eq!(entries[0].description, SharedString::from("fix the thing"));
         assert_eq!(entries[0].author_name, SharedString::from("Emil Martens"));
-        assert_eq!(entries[0].author_email, SharedString::from("emil@example.com"));
+        assert_eq!(
+            entries[0].author_email,
+            SharedString::from("emil@example.com")
+        );
         assert_eq!(entries[0].commit_timestamp, 1790059323);
         assert!(entries[1].bookmarks.is_empty());
         assert_eq!(entries[1].description, SharedString::from(""));
@@ -858,7 +959,9 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].parents,
-            vec![SharedString::from("3333333333333333333333333333333333333333")]
+            vec![SharedString::from(
+                "3333333333333333333333333333333333333333"
+            )]
         );
         assert_eq!(entries[0].bookmarks, vec![SharedString::from("main*")]);
         assert_eq!(entries[0].commit_timestamp, 123);
@@ -867,6 +970,37 @@ mod tests {
     #[test]
     fn test_parse_log_output_empty() {
         assert!(parse_log_output("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_revset_aliases() {
+        const OUTPUT: &str = concat!(
+            "revset-aliases.\"trunk()\" = \"master@origin\"\n",
+            "revset-aliases.all-local = \"all()\"\n",
+            "revset-aliases.mine = \"author(exact:me@example.com)\"\n",
+            "not-an-alias-line\n",
+            "revset-aliases.broken\n",
+        );
+        let aliases = parse_revset_aliases(OUTPUT);
+        assert_eq!(
+            aliases,
+            vec![
+                (
+                    SharedString::from("trunk()"),
+                    SharedString::from("master@origin")
+                ),
+                (SharedString::from("all-local"), SharedString::from("all()")),
+                (
+                    SharedString::from("mine"),
+                    SharedString::from("author(exact:me@example.com)")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_revset_aliases_empty() {
+        assert!(parse_revset_aliases("").is_empty());
     }
 
     #[test]

@@ -8,26 +8,26 @@ use anyhow::Result;
 use editor::Editor;
 use git::{Oid, jj::JjLogEntry, repository::InitialGraphCommitData};
 use gpui::{
-    Anchor, App, Bounds, Context, DefiniteLength, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, Length, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, Render,
+    Anchor, AnyElement, App, Bounds, Context, DefiniteLength, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, Render,
     SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, point, px,
 };
+use menu::Confirm;
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
-use settings::Settings as _;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
-    Chip, ColumnWidthConfig, ContextMenu, HeaderResizeInfo, RedistributableColumnsState, Table,
-    TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip,
-    bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
-    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
-    table_row::TableRow,
+    Chip, ColumnWidthConfig, ContextMenu, ContextMenuEntry, DocumentationSide, HeaderResizeInfo,
+    IconButtonShape, RedistributableColumnsState, Table, TableInteractionState, TableRenderContext,
+    TableResizeBehavior, Tooltip, bind_redistributable_columns, prelude::*,
+    redistribute_hidden_fractions, redistribute_hidden_widths,
+    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
 };
 use workspace::{
-    SerializableItem, Workspace,
+    ModalView, SerializableItem, Workspace,
     item::{Item, ItemEvent},
 };
 
@@ -65,6 +65,9 @@ pub struct JjLog {
     column_widths: Entity<RedistributableColumnsState>,
     column_visibility: TableRow<bool>,
     context_menu: Option<JjLogContextMenu>,
+    // Revset aliases from jj's config layers (user, repo, workspace —
+    // merged), refreshed on each poll; the dropdown offers these.
+    revset_aliases: Vec<(SharedString, SharedString)>,
     // Revset filter input, created lazily on first render: the JjLog
     // constructors have no Window, which Editor::single_line requires.
     revset_editor: Option<Entity<Editor>>,
@@ -128,6 +131,7 @@ impl JjLog {
             column_widths,
             column_visibility: TableRow::from_element(false, 5),
             context_menu: None,
+            revset_aliases: Vec::new(),
             revset_editor: None,
             current_revset: None,
             loading: false,
@@ -180,21 +184,23 @@ impl JjLog {
         }
         let current_revset = self.current_revset.clone();
         cx.spawn(async move |this, cx| {
-            let (entries, error) = match &repository {
+            let (entries, error, aliases) = match &repository {
                 Some(repository) => {
                     let result = match current_revset {
                         Some(revset) => repository.log_revset(revset, LOG_LIMIT).await,
                         None => repository.log(LOG_LIMIT).await,
                     };
+                    let aliases = repository.revset_aliases().await.unwrap_or_default();
                     match result {
-                        Ok(entries) => (entries, None),
-                        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+                        Ok(entries) => (entries, None, aliases),
+                        Err(error) => (Vec::new(), Some(format!("{error:#}")), aliases),
                     }
                 }
-                None => (Vec::new(), None),
+                None => (Vec::new(), None, Vec::new()),
             };
             this.update(cx, move |this, cx| {
                 this.poll_scheduled = false;
+                this.revset_aliases = aliases;
                 // Only a poll that actually invoked jj consumes the throttle
                 // interval; a no-op poll (no jj repository yet) must not delay
                 // the next trigger, or the event carrying the newly discovered
@@ -202,32 +208,38 @@ impl JjLog {
                 if repository.is_some() {
                     this.last_poll = Some(Instant::now());
                 }
-                // Lane data is only built on a successful fetch; jj log
-                // entries arrive children-first, the order add_commits expects.
-                let graph_data = error.as_ref().is_none().then(|| {
-                    let commits: Vec<Arc<InitialGraphCommitData>> = entries
-                        .iter()
-                        .filter_map(|entry| {
-                            let sha = Oid::from_str(&entry.commit_id).ok()?;
-                            Some(Arc::new(InitialGraphCommitData {
-                                sha,
-                                parents: entry
-                                    .parents
-                                    .iter()
-                                    .filter_map(|parent| Oid::from_str(parent).ok())
-                                    .collect(),
-                                ref_names: entry.bookmarks.clone(),
-                            }))
-                        })
-                        .collect();
-                    let mut graph_data = GraphData::new(accent_colors_count(&cx.theme().accents()));
-                    graph_data.add_commits(&commits);
-                    graph_data
-                });
-                this.entries = entries;
-                this.graph_data = graph_data;
+                // A failed poll (e.g. an invalid revset) keeps the last good
+                // rows visible; the error surfaces as a banner under the
+                // search bar. Lane data is only built on a successful fetch;
+                // jj log entries arrive children-first, the order add_commits
+                // expects.
+                match error {
+                    Some(error) => this.error = Some(error),
+                    None => {
+                        let commits: Vec<Arc<InitialGraphCommitData>> = entries
+                            .iter()
+                            .filter_map(|entry| {
+                                let sha = Oid::from_str(&entry.commit_id).ok()?;
+                                Some(Arc::new(InitialGraphCommitData {
+                                    sha,
+                                    parents: entry
+                                        .parents
+                                        .iter()
+                                        .filter_map(|parent| Oid::from_str(parent).ok())
+                                        .collect(),
+                                    ref_names: entry.bookmarks.clone(),
+                                }))
+                            })
+                            .collect();
+                        let mut graph_data =
+                            GraphData::new(accent_colors_count(&cx.theme().accents()));
+                        graph_data.add_commits(&commits);
+                        this.entries = entries;
+                        this.graph_data = Some(graph_data);
+                        this.error = None;
+                    }
+                }
                 this.loading = false;
-                this.error = error;
                 cx.notify();
             })
             .ok();
@@ -258,6 +270,139 @@ impl JjLog {
         let fractions = redistribute_hidden_fractions(&raw, Some(&self.column_visibility));
         let value = |idx: usize| fractions.as_slice().get(idx).copied().unwrap_or(0.0);
         [value(0), value(1), value(2), value(3), value(4)]
+    }
+
+    /// The revset search bar, styled after GitGraph's search bar: a bordered
+    /// editor box (Enter applies) with save and saved-revsets icon buttons.
+    fn render_search_bar(&self, editor: Entity<Editor>, cx: &mut Context<Self>) -> AnyElement {
+        let color = cx.theme().colors();
+        let query_focus_handle = editor.focus_handle(cx).tab_index(1).tab_stop(true);
+
+        h_flex()
+            .key_context("JjLogSearchBar")
+            .tab_index(1)
+            .tab_group()
+            .tab_stop(false)
+            .w_full()
+            .p_1p5()
+            .gap_1p5()
+            .border_b_1()
+            .border_color(color.border_variant)
+            .child(
+                h_flex()
+                    .h_8()
+                    .flex_1()
+                    .min_w_0()
+                    .px_1p5()
+                    .gap_1()
+                    .track_focus(&query_focus_handle)
+                    .border_1()
+                    .border_color(color.border_variant)
+                    .rounded_md()
+                    .bg(color.toolbar_background)
+                    .on_action(cx.listener(Self::confirm_revset))
+                    .child(editor),
+            )
+            .child(
+                IconButton::new("jj-log-revset-aliases", IconName::ChevronDown)
+                    .shape(IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Revset Aliases"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.deploy_saved_revsets_menu(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Applies the editor's contents (Enter); an empty revset clears the
+    /// filter and returns to the default log.
+    fn confirm_revset(&mut self, _: &Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .revset_editor
+            .as_ref()
+            .map(|editor| editor.read(cx).text(cx).trim().to_string());
+        self.current_revset = match text {
+            Some(text) if !text.is_empty() => Some(text),
+            _ => None,
+        };
+        cx.emit(ItemEvent::UpdateTab);
+        self.schedule_poll(cx);
+    }
+
+    /// Fills the editor with `revset` and applies it.
+    fn apply_revset(&mut self, revset: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.revset_editor.as_ref() {
+            editor.update(cx, |editor, cx| editor.set_text(revset.clone(), window, cx));
+        }
+        self.current_revset = Some(revset);
+        cx.emit(ItemEvent::UpdateTab);
+        self.schedule_poll(cx);
+    }
+
+    /// Dropdown of saved revsets, by name; hovering an entry reveals the full
+    /// revset (documentation aside), selecting it fills the editor and applies.
+    fn deploy_saved_revsets_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Refresh on open: adding an alias (`jj config set`) touches no file
+        // in the worktree, so no repository event fires and the cache would
+        // otherwise stay stale until an unrelated poll.
+        let Some(repository) = self
+            .git_store
+            .read(cx)
+            .jj_repositories()
+            .values()
+            .find_map(|state| state.backend().cloned())
+        else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let aliases = repository.revset_aliases().await.unwrap_or_default();
+            this.update_in(cx, |this, window, cx| {
+                this.revset_aliases = aliases.clone();
+                this.deploy_aliases_menu(aliases, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Deploys the revset-alias dropdown from the given (name, expansion)
+    /// pairs; hovering an entry reveals the expansion, selecting it applies
+    /// the alias name as the revset.
+    fn deploy_aliases_menu(
+        &mut self,
+        aliases: Vec<(SharedString, SharedString)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position = window.mouse_position();
+        let focus_handle = self.focus_handle.clone();
+        let jj_log = cx.entity();
+        let context_menu = ContextMenu::build(window, cx, |mut context_menu, _window, _cx| {
+            context_menu = context_menu.context(focus_handle).header("Revset Aliases");
+            if aliases.is_empty() {
+                context_menu = context_menu
+                    .item(ContextMenuEntry::new("No revset-aliases configured").disabled(true));
+            }
+            for (name, expansion) in aliases {
+                let jj_log = jj_log.clone();
+                let aside_expansion = expansion.clone();
+                context_menu = context_menu.item(
+                    ContextMenuEntry::new(name.clone())
+                        .handler(move |window, cx| {
+                            jj_log.update(cx, |this, cx| {
+                                let revset = name.to_string();
+                                this.apply_revset(revset, window, cx);
+                            });
+                        })
+                        .documentation_aside(DocumentationSide::Left, move |_| {
+                            Label::new(aside_expansion.clone()).into_any_element()
+                        }),
+                );
+            }
+            context_menu
+        });
+        self.set_context_menu(context_menu, position, window, cx);
     }
 
     fn set_context_menu(
@@ -590,32 +735,8 @@ fn format_timestamp(timestamp: i64) -> String {
 }
 
 impl Render for JjLog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let entries = self.entries.clone();
-        if let Some(error) = self.error.as_deref() {
-            return v_flex()
-                .size_full()
-                .p_2()
-                .child(Label::new(error).color(Color::Muted));
-        }
-        if self.loading {
-            return v_flex()
-                .size_full()
-                .p_2()
-                .child(Label::new("Loading…").color(Color::Muted));
-        }
-        if entries.is_empty() {
-            return v_flex()
-                .size_full()
-                .p_2()
-                .child(Label::new("no jj repository").color(Color::Muted));
-        }
-        let Some(graph_data) = self.graph_data.as_ref() else {
-            return v_flex()
-                .size_full()
-                .p_2()
-                .child(Label::new("no jj repository").color(Color::Muted));
-        };
         let item_count = entries.len();
         let revset_editor = if let Some(editor) = self.revset_editor.clone() {
             editor
@@ -628,128 +749,126 @@ impl Render for JjLog {
             self.revset_editor = Some(editor.clone());
             editor
         };
-        let revset_bar = h_flex()
-            .w_full()
-            .px_2()
-            .py(px(4.))
-            .items_center()
-            .gap_2()
-            .child(revset_editor)
-            .child({
-                let mut apply_button = div().px_2().text_sm().child(Label::new("Apply"));
-                apply_button
-                    .interactivity()
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        let text = this
-                            .revset_editor
-                            .as_ref()
-                            .map(|editor| editor.read(cx).text(cx).trim().to_string());
-                        this.current_revset = match text {
-                            Some(text) if !text.is_empty() => Some(text),
-                            _ => None,
-                        };
-                        cx.emit(ItemEvent::UpdateTab);
-                        this.schedule_poll(cx);
-                    }));
-                apply_button
-            });
-        let saved_revsets = JjSettings::get_global(cx).saved_revsets.clone();
-        let saved_chips = h_flex()
-            .w_full()
-            .px_2()
-            .py(px(2.))
-            .gap_1()
-            .flex_wrap()
-            .children(
-                saved_revsets
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(ix, revset)| {
-                        let click_revset = revset.clone();
-                        let mut chip = div().px_2().text_sm().child(Label::new(revset));
-                        chip.interactivity()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(editor) = this.revset_editor.as_ref() {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.set_text(click_revset.clone(), window, cx)
-                                    });
-                                }
-                                this.current_revset = Some(click_revset.clone());
-                                cx.emit(ItemEvent::UpdateTab);
-                                this.schedule_poll(cx);
-                            }));
-                        chip
-                    }),
-            )
-            .when(saved_revsets.is_empty(), |this| this.hidden());
+        let search_bar = self.render_search_bar(revset_editor, cx);
+        // A failed poll (e.g. an invalid revset) keeps the last good rows
+        // visible and surfaces the error as a banner; the search bar stays
+        // usable so the revset can be corrected.
+        let error_banner = self.error.as_ref().map(|error| {
+            div()
+                .w_full()
+                .px_2()
+                .py_1()
+                .child(Label::new(error.clone()).color(Color::Warning).truncate())
+                .into_any_element()
+        });
 
-        let row_height = Self::row_height(window, cx);
-        // `GraphData::max_lanes` is private, so derive the same value from
-        // the commit lanes; GitGraph floors the graph at 6 lanes wide.
-        let lane_count = graph_data
-            .commits
-            .iter()
-            .map(|commit| commit.lane + 1)
-            .max()
-            .unwrap_or(6)
-            .max(6);
-        let graph_width = LANE_WIDTH * lane_count as f32 + LEFT_PADDING * 2.0;
-        // Per-commit lane colors for the bookmark chips; cloned so the row
-        // closure can own them (it cannot borrow `self`).
-        let color_idxs: Vec<usize> = graph_data
-            .commits
-            .iter()
-            .map(|commit| commit.color_idx)
-            .collect();
+        let root = if item_count == 0 {
+            let message = if self.loading {
+                "Loading…".to_string()
+            } else if let Some(error) = self.error.as_deref() {
+                format!("Error loading revset: {error}")
+            } else {
+                "no jj repository".to_string()
+            };
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .size_full()
+                .child(search_bar)
+                .children(error_banner)
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .child(Label::new(message).color(Color::Muted)),
+                )
+                .children(self.context_menu.as_ref().map(|context_menu| {
+                    deferred(
+                        anchored()
+                            .position(context_menu.position)
+                            .anchor(Anchor::TopLeft)
+                            .child(context_menu.menu.clone()),
+                    )
+                    .with_priority(1)
+                }))
+                .into_any_element()
+        } else {
+            let Some(graph_data) = self.graph_data.as_ref() else {
+                return v_flex()
+                    .size_full()
+                    .p_2()
+                    .child(Label::new("no jj repository").color(Color::Muted))
+                    .into_any_element();
+            };
 
-        // Column layout: GitGraph's redistributable columns — widths are
-        // draggable via the resize handles and columns toggle from the
-        // header's right-click context menu.
-        let [
-            graph_fraction,
-            description_fraction,
-            date_fraction,
-            author_fraction,
-            commit_fraction,
-        ] = self.column_fractions(window, cx);
-        let table_fraction =
-            description_fraction + date_fraction + author_fraction + commit_fraction;
-        let table_collapsed = table_fraction <= f32::EPSILON;
-        let table_width_config = ColumnWidthConfig::explicit(vec![
-            DefiniteLength::Fraction(description_fraction / table_fraction.max(f32::EPSILON)),
-            DefiniteLength::Fraction(date_fraction / table_fraction.max(f32::EPSILON)),
-            DefiniteLength::Fraction(author_fraction / table_fraction.max(f32::EPSILON)),
-            DefiniteLength::Fraction(commit_fraction / table_fraction.max(f32::EPSILON)),
-        ]);
-        let table_filter = TableRow::from_vec(
-            self.column_visibility
+            let row_height = Self::row_height(window, cx);
+            // `GraphData::max_lanes` is private, so derive the same value from
+            // the commit lanes; GitGraph floors the graph at 6 lanes wide.
+            let lane_count = graph_data
+                .commits
+                .iter()
+                .map(|commit| commit.lane + 1)
+                .max()
+                .unwrap_or(6)
+                .max(6);
+            let graph_width = LANE_WIDTH * lane_count as f32 + LEFT_PADDING * 2.0;
+            // Per-commit lane colors for the bookmark chips; cloned so the row
+            // closure can own them (it cannot borrow `self`).
+            let color_idxs: Vec<usize> = graph_data
+                .commits
+                .iter()
+                .map(|commit| commit.color_idx)
+                .collect();
+
+            // Column layout: GitGraph's redistributable columns — widths are
+            // draggable via the resize handles and columns toggle from the
+            // header's right-click context menu.
+            let [
+                graph_fraction,
+                description_fraction,
+                date_fraction,
+                author_fraction,
+                commit_fraction,
+            ] = self.column_fractions(window, cx);
+            let table_fraction =
+                description_fraction + date_fraction + author_fraction + commit_fraction;
+            let table_collapsed = table_fraction <= f32::EPSILON;
+            let table_width_config = ColumnWidthConfig::explicit(vec![
+                DefiniteLength::Fraction(description_fraction / table_fraction.max(f32::EPSILON)),
+                DefiniteLength::Fraction(date_fraction / table_fraction.max(f32::EPSILON)),
+                DefiniteLength::Fraction(author_fraction / table_fraction.max(f32::EPSILON)),
+                DefiniteLength::Fraction(commit_fraction / table_fraction.max(f32::EPSILON)),
+            ]);
+            let table_filter = TableRow::from_vec(
+                self.column_visibility
+                    .as_slice()
+                    .get(1..5)
+                    .unwrap_or(&[])
+                    .to_vec(),
+                4,
+            );
+            let header_resize_info =
+                HeaderResizeInfo::from_redistributable(&self.column_widths, cx);
+            let header_widths = redistribute_hidden_widths(
+                &self.column_widths.read(cx).widths_to_render(),
+                Some(&self.column_visibility),
+            );
+            let header_context = TableRenderContext::for_column_widths(Some(header_widths), true)
+                .with_column_filter(Some(self.column_visibility.clone()));
+            let graph_visible = !self
+                .column_visibility
                 .as_slice()
-                .get(1..5)
-                .unwrap_or(&[])
-                .to_vec(),
-            4,
-        );
-        let header_resize_info = HeaderResizeInfo::from_redistributable(&self.column_widths, cx);
-        let header_widths = redistribute_hidden_widths(
-            &self.column_widths.read(cx).widths_to_render(),
-            Some(&self.column_visibility),
-        );
-        let header_context = TableRenderContext::for_column_widths(Some(header_widths), true)
-            .with_column_filter(Some(self.column_visibility.clone()));
-        let graph_visible = !self
-            .column_visibility
-            .as_slice()
-            .first()
-            .copied()
-            .unwrap_or(false);
+                .first()
+                .copied()
+                .unwrap_or(false);
 
-        v_flex()
+            v_flex()
             .flex_1()
             .min_w_0()
             .size_full()
-            .child(revset_bar)
-            .child(saved_chips)
+            .child(search_bar)
+            .children(error_banner)
             .child(
                 div()
                     .on_mouse_down(
@@ -852,7 +971,7 @@ impl Render for JjLog {
                                             .uniform_list(
                                                 "jj-log-rows",
                                                 item_count,
-                                                move |range, window, cx| {
+                                                move |range, _window, cx| {
                                                     let accent_colors = cx.theme().accents();
                                                     range
                                                         .map(|idx| {
@@ -962,6 +1081,9 @@ impl Render for JjLog {
                 )
                 .with_priority(1)
             }))
+            .into_any_element()
+        };
+        root
     }
 }
 
