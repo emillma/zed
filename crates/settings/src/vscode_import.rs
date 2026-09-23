@@ -177,6 +177,7 @@ impl VsCodeSettings {
             audio: None,
             auto_update: None,
             base_keymap: Some(BaseKeymapContent::VSCode),
+            jj: None,
             calls: None,
             collaboration_panel: None,
             credentials_url: None,

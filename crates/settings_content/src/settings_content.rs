@@ -197,6 +197,9 @@ pub struct SettingsContent {
 
     pub git_panel: Option<GitPanelSettingsContent>,
 
+    /// Settings for the jj (jujutsu) log panel.
+    pub jj: Option<JjSettingsContent>,
+
     pub tabs: Option<ItemSettingsContent>,
     pub tab_bar: Option<TabBarSettingsContent>,
     pub status_bar: Option<StatusBarSettingsContent>,
@@ -399,7 +402,7 @@ impl SettingsContent {
 fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
-        call_hierarchy, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
+        call_hierarchy, file_finder, git_panel, jj, tabs, tab_bar, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
@@ -720,6 +723,15 @@ pub struct CallSettingsContent {
     ///
     /// Default: false
     pub share_on_join: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct JjSettingsContent {
+    /// Saved revsets shown as clickable chips in the jj log panel.
+    ///
+    /// Default: []
+    pub saved_revsets: Option<Vec<String>>,
 }
 
 #[with_fallible_options]

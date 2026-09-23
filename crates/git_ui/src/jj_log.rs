@@ -10,6 +10,8 @@ use gpui::{
     App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, PathBuilder, Render,
     SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, px, point, uniform_list,
 };
+use crate::jj_settings::JjSettings;
+use settings::Settings as _;
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
@@ -43,7 +45,6 @@ pub struct JjLog {
     // constructors have no Window, which Editor::single_line requires.
     revset_editor: Option<Entity<Editor>>,
     current_revset: Option<String>,
-    saved_revsets: Vec<String>,
     loading: bool,
     error: Option<String>,
     poll_scheduled: bool,
@@ -54,6 +55,7 @@ pub struct JjLog {
 impl JjLog {
     pub fn new(git_store: Entity<GitStore>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&git_store, Self::on_git_store_event);
+        cx.observe_global::<JjSettings>(|_, cx| cx.notify()).detach();
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             git_store,
@@ -61,7 +63,6 @@ impl JjLog {
             graph_data: None,
             revset_editor: None,
             current_revset: None,
-            saved_revsets: revset_config::load(),
             loading: false,
             error: None,
             poll_scheduled: false,
@@ -436,81 +437,36 @@ impl Render for JjLog {
                     }));
                 apply_button
             });
-        let save_button = {
-            let mut save_button = div()
-                .px_2()
-                .text_sm()
-                .child(Label::new("Save"));
-            save_button
-                .interactivity()
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    let text = this
-                        .revset_editor
-                        .as_ref()
-                        .map(|editor| editor.read(cx).text(cx).trim().to_string());
-                    if let Some(text) = text.filter(|text| !text.is_empty()) {
-                        if !this.saved_revsets.contains(&text) {
-                            this.saved_revsets.push(text);
-                            if let Err(err) = revset_config::save(&this.saved_revsets) {
-                                log::warn!("failed to save jj revsets: {err}");
-                            }
-                            cx.emit(ItemEvent::UpdateTab);
-                        }
-                        cx.notify();
-                    }
-                }));
-            save_button
-        };
+        let saved_revsets = JjSettings::get_global(cx).saved_revsets.clone();
         let saved_chips = h_flex()
             .w_full()
             .px_2()
             .py(px(2.))
             .gap_1()
             .flex_wrap()
-            .children(self.saved_revsets.clone().into_iter().enumerate().map(
-                |(ix, revset)| {
-                    let click_revset = revset.clone();
-                    let remove_revset = revset.clone();
-                    let mut chip = div()
-                        .px_2()
-                        .text_sm()
-                        .child(Label::new(revset));
-                    chip.interactivity().on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            if let Some(editor) = this.revset_editor.as_ref() {
-                                editor.update(cx, |editor, cx| {
-                                    editor.set_text(click_revset.clone(), window, cx)
-                                });
-                            }
-                            this.current_revset = Some(click_revset.clone());
-                            cx.emit(ItemEvent::UpdateTab);
-                            this.schedule_poll(cx);
-                        },
-                    ));
-                    let remove = {
-                        let mut remove = div().px_1().child(Label::new("x").color(Color::Muted));
-                        remove.interactivity().on_click(cx.listener(
-                            move |this, _, _window, cx| {
-                                this.saved_revsets.retain(|saved| saved != &remove_revset);
-                                if let Err(err) = revset_config::save(&this.saved_revsets) {
-                                    log::warn!("failed to save jj revsets: {err}");
-                                }
-                                cx.emit(ItemEvent::UpdateTab);
-                                cx.notify();
-                            },
-                        ));
-                        remove
-                    };
-                    h_flex().gap_0p5().child(chip).child(remove)
-                },
-            ))
-            .when(self.saved_revsets.is_empty(), |this| this.hidden());
+            .children(saved_revsets.iter().cloned().enumerate().map(|(ix, revset)| {
+                let click_revset = revset.clone();
+                let mut chip = div().px_2().text_sm().child(Label::new(revset));
+                chip.interactivity().on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        if let Some(editor) = this.revset_editor.as_ref() {
+                            editor.update(cx, |editor, cx| {
+                                editor.set_text(click_revset.clone(), window, cx)
+                            });
+                        }
+                        this.current_revset = Some(click_revset.clone());
+                        cx.emit(ItemEvent::UpdateTab);
+                        this.schedule_poll(cx);
+                    },
+                ));
+                chip
+            }))
+            .when(saved_revsets.is_empty(), |this| this.hidden());
         v_flex()
             .flex_1()
             .size_full()
             .overflow_hidden()
             .child(revset_bar)
-            .child(save_button)
             .child(saved_chips)
             .child(
                 h_flex()
@@ -749,45 +705,5 @@ mod persistence {
                 WHERE item_id = ? AND workspace_id = ?
             }
         }
-    }
-}
-
-mod revset_config {
-    /// Saved revsets live in a user-visible config file
-    /// (`~/.config/zed/jj-revsets.json`) rather than the workspace db, so
-    /// they are global, inspectable, and hand-editable.
-    use anyhow::Result;
-    use paths::config_dir;
-    use serde::{Deserialize, Serialize};
-    use std::{fs, path::PathBuf};
-
-    #[derive(Serialize, Deserialize, Default)]
-    struct SavedRevsets {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        saved_revsets: Vec<String>,
-    }
-
-    fn config_path() -> PathBuf {
-        config_dir().join("jj-revsets.json")
-    }
-
-    pub fn load() -> Vec<String> {
-        fs::read_to_string(config_path())
-            .ok()
-            .and_then(|content| serde_json::from_str::<SavedRevsets>(&content).ok())
-            .map(|saved| saved.saved_revsets)
-            .unwrap_or_default()
-    }
-
-    pub fn save(saved_revsets: &[String]) -> Result<()> {
-        let path = config_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        let json = serde_json::to_string_pretty(&SavedRevsets {
-            saved_revsets: saved_revsets.to_vec(),
-        })?;
-        fs::write(path, json + "\n")?;
-        Ok(())
     }
 }
