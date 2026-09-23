@@ -4,6 +4,7 @@ use crate::git_graph::{
     lane_center_x, to_row_center, COMMIT_CIRCLE_RADIUS, COMMIT_CIRCLE_STROKE_WIDTH, LANE_WIDTH,
     LEFT_PADDING, LINE_WIDTH,
 };
+use editor::Editor;
 use git::{jj::JjLogEntry, repository::InitialGraphCommitData, Oid};
 use gpui::{
     App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, PathBuilder, Render,
@@ -38,6 +39,10 @@ pub struct JjLog {
     entries: Vec<JjLogEntry>,
     #[allow(dead_code)] // Consumed by upcoming graph lane rendering.
     graph_data: Option<GraphData>,
+    // Revset filter input, created lazily on first render: the JjLog
+    // constructors have no Window, which Editor::single_line requires.
+    revset_editor: Option<Entity<Editor>>,
+    current_revset: Option<String>,
     loading: bool,
     error: Option<String>,
     poll_scheduled: bool,
@@ -53,6 +58,8 @@ impl JjLog {
             git_store,
             entries: Vec::new(),
             graph_data: None,
+            revset_editor: None,
+            current_revset: None,
             loading: false,
             error: None,
             poll_scheduled: false,
@@ -101,12 +108,19 @@ impl JjLog {
         if repository.is_some() {
             self.loading = true;
         }
+        let current_revset = self.current_revset.clone();
         cx.spawn(async move |this, cx| {
             let (entries, error) = match &repository {
-                Some(repository) => match repository.log(LOG_LIMIT).await {
-                    Ok(entries) => (entries, None),
-                    Err(error) => (Vec::new(), Some(format!("{error:#}"))),
-                },
+                Some(repository) => {
+                    let result = match current_revset {
+                        Some(revset) => repository.log_revset(revset, LOG_LIMIT).await,
+                        None => repository.log(LOG_LIMIT).await,
+                    };
+                    match result {
+                        Ok(entries) => (entries, None),
+                        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+                    }
+                }
                 None => (Vec::new(), None),
             };
             this.update(cx, move |this, cx| {
@@ -359,7 +373,7 @@ impl JjLog {
     }
 }
 impl Render for JjLog {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entries = self.entries.clone();
         if let Some(error) = self.error.as_deref() {
             return v_flex()
@@ -380,11 +394,50 @@ impl Render for JjLog {
                 .child(Label::new("no jj repository").color(Color::Muted));
         }
         let item_count = entries.len();
+        let revset_editor = if let Some(editor) = self.revset_editor.clone() {
+            editor
+        } else {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("revset (e.g. ::trunk)", window, cx);
+                editor
+            });
+            self.revset_editor = Some(editor.clone());
+            editor
+        };
         let graph_canvas = self.render_graph_canvas(item_count);
+        let revset_bar = h_flex()
+            .w_full()
+            .px_2()
+            .py(px(4.))
+            .items_center()
+            .gap_2()
+            .child(revset_editor)
+            .child({
+                let mut apply_button = div()
+                    .px_2()
+                    .text_sm()
+                    .child(Label::new("Apply"));
+                apply_button
+                    .interactivity()
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        let text = this
+                            .revset_editor
+                            .as_ref()
+                            .map(|editor| editor.read(cx).text(cx).trim().to_string());
+                        this.current_revset = match text {
+                            Some(text) if !text.is_empty() => Some(text),
+                            _ => None,
+                        };
+                        this.schedule_poll(cx);
+                    }));
+                apply_button
+            });
         v_flex()
             .flex_1()
             .size_full()
             .overflow_hidden()
+            .child(revset_bar)
             .child(
                 h_flex()
                     .id("jj_log_scroll")
