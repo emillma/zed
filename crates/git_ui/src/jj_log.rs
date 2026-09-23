@@ -8,18 +8,24 @@ use anyhow::Result;
 use editor::Editor;
 use git::{Oid, jj::JjLogEntry, repository::InitialGraphCommitData};
 use gpui::{
-    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, PathBuilder, Render,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, point, px,
+    Anchor, App, Bounds, Context, DefiniteLength, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, Length, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, Render,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, point, px,
 };
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
 use settings::Settings as _;
 use std::collections::BTreeMap;
-use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, UtcOffset};
-use ui::{Table, TableInteractionState, prelude::*};
+use ui::{
+    Chip, ColumnWidthConfig, ContextMenu, HeaderResizeInfo, RedistributableColumnsState, Table,
+    TableInteractionState, TableRenderContext, TableResizeBehavior, Tooltip,
+    bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
+    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
+    table_row::TableRow,
+};
 use workspace::{
     SerializableItem, Workspace,
     item::{Item, ItemEvent},
@@ -36,6 +42,14 @@ const LOG_LIMIT: usize = 200;
 /// agree on row geometry.
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
+/// Column fractions of the full panel width, copied from GitGraph's
+/// 5-column defaults (graph, description, date, author, commit).
+const GRAPH_COLUMN_FRACTION: f32 = 0.14;
+const DESCRIPTION_COLUMN_FRACTION: f32 = 0.6192;
+const DATE_COLUMN_FRACTION: f32 = 0.1032;
+const AUTHOR_COLUMN_FRACTION: f32 = 0.086;
+const COMMIT_COLUMN_FRACTION: f32 = 0.0516;
+
 /// The jj history panel: a list of the first 200 changes of the first
 /// jj repository in the project, if any. Rendered like GitGraph: a
 /// `ui::Table` of text columns with the lane graph painted on a canvas
@@ -46,6 +60,11 @@ pub struct JjLog {
     entries: Vec<JjLogEntry>,
     graph_data: Option<GraphData>,
     table_interaction_state: Entity<TableInteractionState>,
+    // GitGraph's column machinery: user-draggable widths and per-column
+    // visibility toggled from the header's right-click context menu.
+    column_widths: Entity<RedistributableColumnsState>,
+    column_visibility: TableRow<bool>,
+    context_menu: Option<JjLogContextMenu>,
     // Revset filter input, created lazily on first render: the JjLog
     // constructors have no Window, which Editor::single_line requires.
     revset_editor: Option<Entity<Editor>>,
@@ -57,15 +76,48 @@ pub struct JjLog {
     _subscription: Subscription,
 }
 
+struct JjLogContextMenu {
+    menu: Entity<ContextMenu>,
+    position: Point<Pixels>,
+    _subscription: Subscription,
+}
+
 impl JjLog {
     pub fn new(git_store: Entity<GitStore>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&git_store, Self::on_git_store_event);
-        cx.observe_global::<JjSettings>(|_, cx| cx.notify())
-            .detach();
+        cx.observe_global::<JjSettings>(|this, cx| {
+            // The `uniform_list` powering the table caches the item size from
+            // its last layout; invalidate it so a changed row height (font
+            // size, scale) re-measures on the next frame. Mirrors GitGraph.
+            this.table_interaction_state.update(cx, |state, _cx| {
+                state.scroll_handle.0.borrow_mut().last_item_size = None;
+            });
+            cx.notify();
+        })
+        .detach();
         let table_interaction_state = cx.new(|cx| {
             let mut state = TableInteractionState::new(cx);
             state.focus_handle = state.focus_handle.tab_index(1).tab_stop(true);
             state
+        });
+        let column_widths = cx.new(|_cx| {
+            RedistributableColumnsState::new(
+                5,
+                vec![
+                    DefiniteLength::Fraction(GRAPH_COLUMN_FRACTION),
+                    DefiniteLength::Fraction(DESCRIPTION_COLUMN_FRACTION),
+                    DefiniteLength::Fraction(DATE_COLUMN_FRACTION),
+                    DefiniteLength::Fraction(AUTHOR_COLUMN_FRACTION),
+                    DefiniteLength::Fraction(COMMIT_COLUMN_FRACTION),
+                ],
+                vec![
+                    TableResizeBehavior::Resizable,
+                    TableResizeBehavior::Resizable,
+                    TableResizeBehavior::Resizable,
+                    TableResizeBehavior::Resizable,
+                    TableResizeBehavior::Resizable,
+                ],
+            )
         });
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -73,6 +125,9 @@ impl JjLog {
             entries: Vec::new(),
             graph_data: None,
             table_interaction_state,
+            column_widths,
+            column_visibility: TableRow::from_element(false, 5),
+            context_menu: None,
             revset_editor: None,
             current_revset: None,
             loading: false,
@@ -190,6 +245,98 @@ impl JjLog {
         let scale = window.scale_factor();
 
         (raw * scale).round() / scale
+    }
+
+    /// Column fractions of the full panel width, from the redistributable
+    /// column state (user-draggable), with hidden columns zeroed. Mirrors
+    /// GitGraph's `preview_column_fractions`.
+    fn column_fractions(&self, window: &Window, cx: &App) -> [f32; 5] {
+        let raw = self
+            .column_widths
+            .read(cx)
+            .preview_fractions(window.rem_size());
+        let fractions = redistribute_hidden_fractions(&raw, Some(&self.column_visibility));
+        let value = |idx: usize| fractions.as_slice().get(idx).copied().unwrap_or(0.0);
+        [value(0), value(1), value(2), value(3), value(4)]
+    }
+
+    fn set_context_menu(
+        &mut self,
+        context_menu: Entity<ContextMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&context_menu.focus_handle(cx), cx);
+
+        let subscription = cx.subscribe_in(
+            &context_menu,
+            window,
+            |this, _, _: &DismissEvent, window, cx| {
+                if this.context_menu.as_ref().is_some_and(|context_menu| {
+                    context_menu
+                        .menu
+                        .focus_handle(cx)
+                        .contains_focused(window, cx)
+                }) {
+                    cx.focus_self(window);
+                }
+                this.context_menu.take();
+                cx.notify();
+            },
+        );
+        self.context_menu = Some(JjLogContextMenu {
+            menu: context_menu,
+            position,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn toggle_column_visibility(&mut self, col_idx: usize, cx: &mut Context<Self>) {
+        if let Some(slot) = self.column_visibility.as_mut_slice().get_mut(col_idx) {
+            *slot = !*slot;
+            cx.emit(ItemEvent::Edit);
+        }
+    }
+
+    fn deploy_header_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const COLUMNS: &[&str] = &["Graph", "Description", "Date", "Author", "Commit"];
+
+        let filter = self.column_visibility.clone();
+        let visible_count = filter.as_slice().iter().filter(|hidden| !**hidden).count();
+        let focus_handle = self.focus_handle.clone();
+        let jj_log = cx.entity();
+        let context_menu = ContextMenu::build(window, cx, |mut context_menu, _window, _cx| {
+            context_menu = context_menu.context(focus_handle).header("Columns");
+            for (col_idx, label) in COLUMNS.iter().enumerate() {
+                let is_visible = !filter.get(col_idx).copied().unwrap_or(false);
+                // Disable hiding the last remaining visible column.
+                let can_toggle = !is_visible || visible_count > 1;
+                let jj_log = jj_log.clone();
+                context_menu = context_menu.toggleable_entry_disabled_when(
+                    label.to_string(),
+                    is_visible,
+                    !can_toggle,
+                    IconPosition::End,
+                    None,
+                    move |_window, cx| {
+                        jj_log.update(cx, |this, cx| {
+                            this.toggle_column_visibility(col_idx, cx);
+                            cx.notify();
+                        });
+                    },
+                );
+            }
+            context_menu
+        });
+
+        self.set_context_menu(context_menu, position, window, cx);
     }
 
     /// Paints the lane graph over the table's visible rows, synced to the
@@ -548,6 +695,54 @@ impl Render for JjLog {
             .unwrap_or(6)
             .max(6);
         let graph_width = LANE_WIDTH * lane_count as f32 + LEFT_PADDING * 2.0;
+        // Per-commit lane colors for the bookmark chips; cloned so the row
+        // closure can own them (it cannot borrow `self`).
+        let color_idxs: Vec<usize> = graph_data
+            .commits
+            .iter()
+            .map(|commit| commit.color_idx)
+            .collect();
+
+        // Column layout: GitGraph's redistributable columns — widths are
+        // draggable via the resize handles and columns toggle from the
+        // header's right-click context menu.
+        let [
+            graph_fraction,
+            description_fraction,
+            date_fraction,
+            author_fraction,
+            commit_fraction,
+        ] = self.column_fractions(window, cx);
+        let table_fraction =
+            description_fraction + date_fraction + author_fraction + commit_fraction;
+        let table_collapsed = table_fraction <= f32::EPSILON;
+        let table_width_config = ColumnWidthConfig::explicit(vec![
+            DefiniteLength::Fraction(description_fraction / table_fraction.max(f32::EPSILON)),
+            DefiniteLength::Fraction(date_fraction / table_fraction.max(f32::EPSILON)),
+            DefiniteLength::Fraction(author_fraction / table_fraction.max(f32::EPSILON)),
+            DefiniteLength::Fraction(commit_fraction / table_fraction.max(f32::EPSILON)),
+        ]);
+        let table_filter = TableRow::from_vec(
+            self.column_visibility
+                .as_slice()
+                .get(1..5)
+                .unwrap_or(&[])
+                .to_vec(),
+            4,
+        );
+        let header_resize_info = HeaderResizeInfo::from_redistributable(&self.column_widths, cx);
+        let header_widths = redistribute_hidden_widths(
+            &self.column_widths.read(cx).widths_to_render(),
+            Some(&self.column_visibility),
+        );
+        let header_context = TableRenderContext::for_column_widths(Some(header_widths), true)
+            .with_column_filter(Some(self.column_visibility.clone()));
+        let graph_visible = !self
+            .column_visibility
+            .as_slice()
+            .first()
+            .copied()
+            .unwrap_or(false);
 
         v_flex()
             .flex_1()
@@ -556,122 +751,217 @@ impl Render for JjLog {
             .child(revset_bar)
             .child(saved_chips)
             .child(
-                div().relative().flex_1().w_full().overflow_hidden().child(
-                    h_flex()
-                        .size_full()
-                        .child(
-                            div()
-                                .id("jj-log-graph")
-                                .w(graph_width)
-                                .h_full()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .child(div().size_full().child(self.render_graph_canvas(
-                                    graph_data,
-                                    row_height,
-                                    graph_width,
-                                    window,
-                                    cx,
-                                ))),
-                        )
-                        .child(
-                            div().flex_1().h_full().min_w_0().child(
-                                Table::new(5)
-                                    .interactable(&self.table_interaction_state)
-                                    .hide_row_borders()
-                                    .hide_row_hover()
-                                    .uniform_list(
-                                        "jj-log-rows",
-                                        item_count,
-                                        move |range, window, cx| {
-                                            let row_height = JjLog::row_height(window, cx);
-                                            range
-                                                .map(|idx| {
-                                                    let entry = &entries[idx];
-                                                    let change_id = entry.change_id.to_string();
-                                                    let change_short = change_id
-                                                        [..change_id.len().min(8)]
-                                                        .to_string();
-                                                    let bookmarks = entry
-                                                        .bookmarks
-                                                        .iter()
-                                                        .map(|bookmark| bookmark.to_string())
-                                                        .collect::<Vec<_>>()
-                                                        .join(", ");
-                                                    let description = entry
-                                                        .description
-                                                        .lines()
-                                                        .next()
-                                                        .unwrap_or("");
-                                                    let has_description = !description.is_empty();
-                                                    let author_name = entry.author_name.to_string();
-                                                    let timestamp =
-                                                        format_timestamp(entry.commit_timestamp);
-                                                    vec![
-                                                        div()
-                                                            .h(row_height)
-                                                            .px_2()
-                                                            .child(
-                                                                Label::new(change_short)
-                                                                    .color(Color::Default)
-                                                                    .truncate(),
-                                                            )
-                                                            .into_any_element(),
-                                                        div()
-                                                            .h(row_height)
-                                                            .px_2()
-                                                            .min_w_0()
-                                                            .child(
-                                                                Label::new(if has_description {
-                                                                    description
-                                                                } else {
-                                                                    "(no description set)"
-                                                                })
-                                                                .color(if has_description {
-                                                                    Color::Default
-                                                                } else {
-                                                                    Color::Muted
-                                                                })
-                                                                .truncate(),
-                                                            )
-                                                            .into_any_element(),
-                                                        div()
-                                                            .h(row_height)
-                                                            .px_2()
-                                                            .min_w_0()
-                                                            .child(
-                                                                Label::new(bookmarks)
-                                                                    .color(Color::Accent)
-                                                                    .truncate(),
-                                                            )
-                                                            .into_any_element(),
-                                                        div()
-                                                            .h(row_height)
-                                                            .px_2()
-                                                            .child(
-                                                                Label::new(author_name)
-                                                                    .color(Color::Muted)
-                                                                    .truncate(),
-                                                            )
-                                                            .into_any_element(),
-                                                        div()
-                                                            .h(row_height)
-                                                            .px_2()
-                                                            .child(
-                                                                Label::new(timestamp)
-                                                                    .color(Color::Muted)
-                                                                    .truncate(),
-                                                            )
-                                                            .into_any_element(),
-                                                    ]
-                                                })
-                                                .collect()
-                                        },
+                div()
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.deploy_header_context_menu(event.position, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(render_table_header(
+                        TableRow::from_vec(
+                            vec![
+                                Label::new("Graph")
+                                    .color(Color::Muted)
+                                    .truncate()
+                                    .into_any_element(),
+                                Label::new("Description")
+                                    .color(Color::Muted)
+                                    .truncate()
+                                    .into_any_element(),
+                                Label::new("Date")
+                                    .color(Color::Muted)
+                                    .truncate()
+                                    .into_any_element(),
+                                Label::new("Author")
+                                    .color(Color::Muted)
+                                    .truncate()
+                                    .into_any_element(),
+                                Label::new("Commit")
+                                    .color(Color::Muted)
+                                    .truncate()
+                                    .into_any_element(),
+                            ],
+                            5,
+                        ),
+                        header_context,
+                        Some(header_resize_info),
+                        Some(self.column_widths.entity_id()),
+                        cx,
+                    )),
+            )
+            .child(bind_redistributable_columns(
+                div()
+                    .relative()
+                    .flex_1()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .size_full()
+                            .when(graph_visible, |this| {
+                                this.child(
+                                    div()
+                                        .id("jj-log-graph")
+                                        .map(|this| {
+                                            if table_collapsed {
+                                                this.w(graph_width)
+                                            } else {
+                                                this.w(DefiniteLength::Fraction(graph_fraction))
+                                            }
+                                        })
+                                        .h_full()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .child(div().size_full().child(self.render_graph_canvas(
+                                            graph_data,
+                                            row_height,
+                                            graph_width,
+                                            window,
+                                            cx,
+                                        ))),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .map(|this| {
+                                        if table_collapsed {
+                                            this.flex_1()
+                                        } else {
+                                            this.w(DefiniteLength::Fraction(table_fraction))
+                                        }
+                                    })
+                                    .h_full()
+                                    .min_w_0()
+                                    .child(
+                                        Table::new(4)
+                                            .interactable(&self.table_interaction_state)
+                                            .hide_row_borders()
+                                            .hide_row_hover()
+                                            .width_config(table_width_config)
+                                            .column_filter(table_filter)
+                                            // Pin the row height to the value
+                                            // captured at render time so the
+                                            // canvas dots and the text rows
+                                            // share one geometry, exactly like
+                                            // GitGraph's map_row.
+                                            .map_row(move |(_, row), _window, _cx| {
+                                                row.h(row_height).into_any_element()
+                                            })
+                                            .uniform_list(
+                                                "jj-log-rows",
+                                                item_count,
+                                                move |range, window, cx| {
+                                                    let accent_colors = cx.theme().accents();
+                                                    range
+                                                        .map(|idx| {
+                                                            let entry = &entries[idx];
+                                                            let accent_color = accent_colors
+                                                                .0
+                                                                .get(color_idxs[idx])
+                                                                .copied()
+                                                                .unwrap_or_default();
+                                                            let change_id =
+                                                                entry.change_id.to_string();
+                                                            let change_short = change_id
+                                                                [..change_id.len().min(8)]
+                                                                .to_string();
+                                                            let description = entry
+                                                                .description
+                                                                .lines()
+                                                                .next()
+                                                                .unwrap_or("");
+                                                            let has_description =
+                                                                !description.is_empty();
+                                                            let timestamp = format_timestamp(
+                                                                entry.commit_timestamp,
+                                                            );
+                                                            let column_label =
+                                                                |label: SharedString| {
+                                                                    Label::new(label)
+                                                                        .color(Color::Muted)
+                                                                        .truncate()
+                                                                        .into_any_element()
+                                                                };
+                                                            // Description cell with bookmark
+                                                            // chips inline, mirroring
+                                                            // GitGraph's render_table_rows.
+                                                            let description_cell = div()
+                                                                .overflow_hidden()
+                                                                .child(
+                                                                    h_flex()
+                                                                        .gap_2()
+                                                                        .overflow_hidden()
+                                                                        .children(
+                                                                            (!entry.bookmarks.is_empty())
+                                                                                .then(|| {
+                                                                                    h_flex()
+                                                                                        .gap_1()
+                                                                                        .children(
+                                                                                            entry.bookmarks.iter().map(|name| {
+                                                                                                Chip::new(name.clone())
+                                                                                                    .label_size(LabelSize::Small)
+                                                                                                    .truncate()
+                                                                                                    .tooltip({
+                                                                                                        let name = name.clone();
+                                                                                                        move |_, cx| {
+                                                                                                            Tooltip::simple(name.clone(), cx)
+                                                                                                        }
+                                                                                                    })
+                                                                                                    .bg_color(accent_color.opacity(0.08))
+                                                                                                    .border_color(accent_color.opacity(0.25))
+                                                                                            }),
+                                                                                        )
+                                                                                })
+                                                                        )
+                                                                        .child(
+                                                                            Label::new(if has_description {
+                                                                                description
+                                                                            } else {
+                                                                                "(no description set)"
+                                                                            })
+                                                                            .color(Color::Muted)
+                                                                            .truncate(),
+                                                                        ),
+                                                                )
+                                                                .into_any_element();
+                                                            vec![
+                                                                description_cell,
+                                                                column_label(timestamp.into()),
+                                                                column_label(
+                                                                    entry
+                                                                        .author_name
+                                                                        .to_string()
+                                                                        .into(),
+                                                                ),
+                                                                column_label(change_short.into()),
+                                                            ]
+                                                        })
+                                                        .collect()
+                                                },
+                                            ),
                                     ),
                             ),
-                        ),
-                ),
-            )
+                    )
+                    .child(render_redistributable_columns_resize_handles(
+                        &self.column_widths,
+                        Some(&self.column_visibility),
+                        window,
+                        cx,
+                    )),
+                self.column_widths.clone(),
+                Some(self.column_visibility.clone()),
+            ))
+            .children(self.context_menu.as_ref().map(|context_menu| {
+                deferred(
+                    anchored()
+                        .position(context_menu.position)
+                        .anchor(Anchor::TopLeft)
+                        .child(context_menu.menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
 
