@@ -43,6 +43,7 @@ pub struct JjLog {
     // constructors have no Window, which Editor::single_line requires.
     revset_editor: Option<Entity<Editor>>,
     current_revset: Option<String>,
+    saved_revsets: Vec<String>,
     loading: bool,
     error: Option<String>,
     poll_scheduled: bool,
@@ -60,6 +61,7 @@ impl JjLog {
             graph_data: None,
             revset_editor: None,
             current_revset: None,
+            saved_revsets: Vec::new(),
             loading: false,
             error: None,
             poll_scheduled: false,
@@ -429,15 +431,81 @@ impl Render for JjLog {
                             Some(text) if !text.is_empty() => Some(text),
                             _ => None,
                         };
+                        cx.emit(ItemEvent::UpdateTab);
                         this.schedule_poll(cx);
                     }));
                 apply_button
             });
+        let save_button = {
+            let mut save_button = div()
+                .px_2()
+                .text_sm()
+                .child(Label::new("Save"));
+            save_button
+                .interactivity()
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    let text = this
+                        .revset_editor
+                        .as_ref()
+                        .map(|editor| editor.read(cx).text(cx).trim().to_string());
+                    if let Some(text) = text.filter(|text| !text.is_empty()) {
+                        if !this.saved_revsets.contains(&text) {
+                            this.saved_revsets.push(text);
+                            cx.emit(ItemEvent::UpdateTab);
+                        }
+                        cx.notify();
+                    }
+                }));
+            save_button
+        };
+        let saved_chips = h_flex()
+            .w_full()
+            .px_2()
+            .py(px(2.))
+            .gap_1()
+            .flex_wrap()
+            .children(self.saved_revsets.clone().into_iter().enumerate().map(
+                |(ix, revset)| {
+                    let click_revset = revset.clone();
+                    let remove_revset = revset.clone();
+                    let mut chip = div()
+                        .px_2()
+                        .text_sm()
+                        .child(Label::new(revset));
+                    chip.interactivity().on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            if let Some(editor) = this.revset_editor.as_ref() {
+                                editor.update(cx, |editor, cx| {
+                                    editor.set_text(click_revset.clone(), window, cx)
+                                });
+                            }
+                            this.current_revset = Some(click_revset.clone());
+                            cx.emit(ItemEvent::UpdateTab);
+                            this.schedule_poll(cx);
+                        },
+                    ));
+                    let remove = {
+                        let mut remove = div().px_1().child(Label::new("x").color(Color::Muted));
+                        remove.interactivity().on_click(cx.listener(
+                            move |this, _, _window, cx| {
+                                this.saved_revsets.retain(|saved| saved != &remove_revset);
+                                cx.emit(ItemEvent::UpdateTab);
+                                cx.notify();
+                            },
+                        ));
+                        remove
+                    };
+                    h_flex().gap_0p5().child(chip).child(remove)
+                },
+            ))
+            .when(self.saved_revsets.is_empty(), |this| this.hidden());
         v_flex()
             .flex_1()
             .size_full()
             .overflow_hidden()
             .child(revset_bar)
+            .child(save_button)
+            .child(saved_chips)
             .child(
                 h_flex()
                     .id("jj_log_scroll")
@@ -465,7 +533,6 @@ impl Render for JjLog {
                                 .join(", ");
                             let description = entry.description.lines().next().unwrap_or("");
                             let author = entry.author_name.to_string();
-                            let timestamp = entry.commit_timestamp.to_string();
                             let timestamp = JjLog::format_timestamp(entry.commit_timestamp);
                             h_flex()
                                 .id(("jj-log-item", index))
@@ -580,26 +647,114 @@ impl SerializableItem for JjLog {
     fn deserialize(
         project: Entity<project::Project>,
         _workspace: WeakEntity<Workspace>,
-        _: workspace::WorkspaceId,
-        _: workspace::ItemId,
+        workspace_id: workspace::WorkspaceId,
+        item_id: workspace::ItemId,
         _window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
         let git_store = project.read(cx).git_store().clone();
-        Task::ready(Ok(cx.new(|cx| JjLog::new(git_store, cx))))
+        let saved = persistence::JjLogDb::global(cx)
+            .get_jj_log(item_id, workspace_id)
+            .ok()
+            .flatten();
+        Task::ready(Ok(cx.new(|cx| {
+            let mut this = JjLog::new(git_store, cx);
+            if let Some((saved_revsets, current_revset)) = saved {
+                this.saved_revsets = saved_revsets
+                    .map(|revsets| {
+                        revsets
+                            .lines()
+                            .filter(|revset| !revset.is_empty())
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                this.current_revset = current_revset;
+            }
+            this
+        })))
     }
 
     fn serialize(
         &mut self,
-        _: &mut Workspace,
-        _: workspace::ItemId,
+        workspace: &mut Workspace,
+        item_id: workspace::ItemId,
         _: bool,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        Some(Task::ready(Ok(())))
+        let workspace_id = workspace.database_id()?;
+        let saved_revsets = (!self.saved_revsets.is_empty())
+            .then(|| self.saved_revsets.join("\n"));
+        let current_revset = self.current_revset.clone();
+        let db = persistence::JjLogDb::global(cx);
+        Some(cx.background_spawn(async move {
+            db.save_jj_log(item_id, workspace_id, saved_revsets, current_revset).await
+        }))
     }
 
-    fn should_serialize(&self, _: &Self::Event) -> bool {
-        false
+    fn should_serialize(&self, event: &Self::Event) -> bool {
+        matches!(event, ItemEvent::UpdateTab | ItemEvent::Edit)
+    }
+}
+
+mod persistence {
+    use db::{
+        query,
+        sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
+        sqlez_macros::sql,
+    };
+    use workspace::WorkspaceDb;
+
+    pub struct JjLogDb(ThreadSafeConnection);
+
+    impl Domain for JjLogDb {
+        const NAME: &str = stringify!(JjLogDb);
+
+        const MIGRATIONS: &[&str] = &[
+            sql!(
+                CREATE TABLE jj_logs (
+                    workspace_id INTEGER,
+                    item_id INTEGER UNIQUE,
+                    is_open INTEGER DEFAULT FALSE,
+
+                    PRIMARY KEY(workspace_id, item_id),
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                ) STRICT;
+            ),
+            sql!(
+                ALTER TABLE jj_logs ADD COLUMN saved_revsets TEXT;
+                ALTER TABLE jj_logs ADD COLUMN current_revset TEXT;
+            ),
+        ];
+    }
+
+    db::static_connection!(JjLogDb, [WorkspaceDb]);
+
+    impl JjLogDb {
+        query! {
+            pub async fn save_jj_log(
+                item_id: workspace::ItemId,
+                workspace_id: workspace::WorkspaceId,
+                saved_revsets: Option<String>,
+                current_revset: Option<String>
+            ) -> Result<()> {
+                INSERT OR REPLACE INTO jj_logs(
+                    item_id, workspace_id, saved_revsets, current_revset
+                )
+                VALUES (?, ?, ?, ?)
+            }
+        }
+
+        query! {
+            pub fn get_jj_log(
+                item_id: workspace::ItemId,
+                workspace_id: workspace::WorkspaceId
+            ) -> Result<Option<(Option<String>, Option<String>)>> {
+                SELECT saved_revsets, current_revset
+                FROM jj_logs
+                WHERE item_id = ? AND workspace_id = ?
+            }
+        }
     }
 }
