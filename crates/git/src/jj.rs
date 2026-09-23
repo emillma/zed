@@ -248,6 +248,7 @@ pub struct JjLogEntry {
     pub bookmarks: Vec<SharedString>,
     pub description: SharedString,
     pub author_name: SharedString,
+    pub author_email: SharedString,
     pub commit_timestamp: i64,
 }
 
@@ -452,7 +453,7 @@ const SHOW_TEMPLATE: &str = "commit_id ++ \"|JJSEP|\" ++ description ++ \"|JJSEP
 
 /// `jj log` template: one row per revision, `|JJSEP|`-separated fields,
 /// each row terminated by `"\n"` (without it, rows concatenate).
-const LOG_TEMPLATE: &str = "change_id.short() ++ \"|JJSEP|\" ++ commit_id ++ \"|JJSEP|\" ++ parents.map(|p| p.commit_id()).join(\" \") ++ \"|JJSEP|\" ++ bookmarks.join(\",\") ++ \"|JJSEP|\" ++ description.first_line() ++ \"|JJSEP|\" ++ author.name() ++ \"|JJSEP|\" ++ committer.timestamp().format(\"%s\") ++ \"\\n\"";
+const LOG_TEMPLATE: &str = "change_id.short() ++ \"|JJSEP|\" ++ commit_id ++ \"|JJSEP|\" ++ parents.map(|p| p.commit_id()).join(\" \") ++ \"|JJSEP|\" ++ bookmarks.join(\",\") ++ \"|JJSEP|\" ++ description.first_line() ++ \"|JJSEP|\" ++ author.name() ++ \"|JJSEP|\" ++ author.email() ++ \"|JJSEP|\" ++ committer.timestamp().format(\"%s\") ++ \"\\n\"";
 
 /// Parses `show` template output (sha, description, committer epoch, author name,
 /// author email) into CommitDetails.
@@ -479,7 +480,7 @@ fn parse_log_output(output: &str) -> Vec<JjLogEntry> {
         .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split(SEP).collect();
-            if fields.len() < 7 {
+            if fields.len() < 8 {
                 return None;
             }
             Some(JjLogEntry {
@@ -499,7 +500,8 @@ fn parse_log_output(output: &str) -> Vec<JjLogEntry> {
                     .collect(),
                 description: fields[4].trim_end().into(),
                 author_name: fields[5].trim().into(),
-                commit_timestamp: fields[6].trim().parse::<i64>().unwrap_or(0),
+                author_email: fields[6].trim().into(),
+                commit_timestamp: fields[7].trim().parse::<i64>().unwrap_or(0),
             })
         })
         .collect()
@@ -820,8 +822,8 @@ mod tests {
     #[test]
     fn test_parse_log_output_multi_row() {
         const OUTPUT: &str = concat!(
-            "abc123def456|JJSEP|0123456789abcdef0123456789abcdef|JJSEP|1111111111111111111111111111111111111111 2222222222222222222222222222222222222222|JJSEP|main*,feature|JJSEP|fix the thing|JJSEP|Emil Martens|JJSEP|1790059323\n",
-            "789fedcba654|JJSEP|9876543210fedc9876543210fedc9876|JJSEP||JJSEP||JJSEP||JJSEP|Ana Torres|JJSEP|1790059000\n"
+            "abc123def456|JJSEP|0123456789abcdef0123456789abcdef|JJSEP|1111111111111111111111111111111111111111 2222222222222222222222222222222222222222|JJSEP|main*,feature|JJSEP|fix the thing|JJSEP|Emil Martens|JJSEP|emil@example.com|JJSEP|1790059323\n",
+            "789fedcba654|JJSEP|9876543210fedc9876543210fedc9876|JJSEP||JJSEP||JJSEP||JJSEP|Ana Torres|JJSEP|ana@example.com|JJSEP|1790059000\n"
         );
         let entries = parse_log_output(OUTPUT);
         assert_eq!(entries.len(), 2);
@@ -841,6 +843,7 @@ mod tests {
         );
         assert_eq!(entries[0].description, SharedString::from("fix the thing"));
         assert_eq!(entries[0].author_name, SharedString::from("Emil Martens"));
+        assert_eq!(entries[0].author_email, SharedString::from("emil@example.com"));
         assert_eq!(entries[0].commit_timestamp, 1790059323);
         assert!(entries[1].bookmarks.is_empty());
         assert_eq!(entries[1].description, SharedString::from(""));
@@ -850,7 +853,7 @@ mod tests {
     #[test]
     fn test_parse_log_output_single_row() {
         let entries = parse_log_output(
-            "abc123def456|JJSEP|0123|JJSEP|3333333333333333333333333333333333333333|JJSEP|main*|JJSEP|hello|JJSEP|Bob|JJSEP|123",
+            "abc123def456|JJSEP|0123|JJSEP|3333333333333333333333333333333333333333|JJSEP|main*|JJSEP|hello|JJSEP|Bob|JJSEP|bob@example.com|JJSEP|123",
         );
         assert_eq!(entries.len(), 1);
         assert_eq!(
