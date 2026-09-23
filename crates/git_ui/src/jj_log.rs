@@ -1,21 +1,25 @@
 use anyhow::Result;
 use crate::git_graph::{
-    CommitLineSegment, GraphData, accent_colors_count,
+    CurveKind, CommitLineSegment, GraphData, accent_colors_count, draw_commit_circle,
+    lane_center_x, timestamp_format, to_row_center, COMMIT_CIRCLE_RADIUS,
+    COMMIT_CIRCLE_STROKE_WIDTH, LANE_WIDTH, LEFT_PADDING, LINE_WIDTH,
 };
+use crate::jj_settings::JjSettings;
 use editor::Editor;
 use git::{jj::JjLogEntry, repository::InitialGraphCommitData, Oid};
 use gpui::{
     App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, PathBuilder, Render,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, px, point, uniform_list,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, px, point,
 };
-use crate::jj_settings::JjSettings;
-use settings::Settings as _;
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
-use std::collections::{BTreeMap, HashMap};
+use settings::Settings as _;
+use std::collections::BTreeMap;
+use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use ui::prelude::*;
+use time::{OffsetDateTime, UtcOffset};
+use ui::{Table, TableInteractionState, prelude::*};
 use workspace::{
     SerializableItem, Workspace,
     item::{Item, ItemEvent},
@@ -27,32 +31,21 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Maximum number of log entries fetched for the history panel.
 const LOG_LIMIT: usize = 200;
 
-/// Fixed row height for the uniform history list; each row carries its own
-/// small graph canvas, so no shared canvas geometry is needed.
-const ROW_HEIGHT: Pixels = px(32.);
-
-/// Per-row graph state for the jj history panel: the row's node (lane +
-/// accent color), the lane columns whose lines pass through this row, and
-/// the bend landing on this row, if any (`(from_column, to_column)`).
-/// Rows scroll inside the uniform_list, so graph and text move together.
-#[derive(Clone, Default)]
-struct RowGraph {
-    node_lane: usize,
-    color_idx: usize,
-    passes: Vec<usize>,
-    bend: Option<(usize, usize)>,
-}
+/// Vertical padding added to the line height for each row. Mirrors
+/// GitGraph's private `ROW_VERTICAL_PADDING` so the canvas and the table
+/// agree on row geometry.
+const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
 /// The jj history panel: a list of the first 200 changes of the first
-/// jj repository in the project, if any.
+/// jj repository in the project, if any. Rendered like GitGraph: a
+/// `ui::Table` of text columns with the lane graph painted on a canvas
+/// beside it, synced to the table's scroll state.
 pub struct JjLog {
     focus_handle: FocusHandle,
     git_store: Entity<GitStore>,
     entries: Vec<JjLogEntry>,
     graph_data: Option<GraphData>,
-    /// Per-row graph state, rebuilt on every successful poll (cleared on
-    /// fetch error); rows fall back to `RowGraph::default()`.
-    row_graphs: Vec<RowGraph>,
+    table_interaction_state: Entity<TableInteractionState>,
     // Revset filter input, created lazily on first render: the JjLog
     // constructors have no Window, which Editor::single_line requires.
     revset_editor: Option<Entity<Editor>>,
@@ -68,12 +61,17 @@ impl JjLog {
     pub fn new(git_store: Entity<GitStore>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&git_store, Self::on_git_store_event);
         cx.observe_global::<JjSettings>(|_, cx| cx.notify()).detach();
+        let table_interaction_state = cx.new(|cx| {
+            let mut state = TableInteractionState::new(cx);
+            state.focus_handle = state.focus_handle.tab_index(1).tab_stop(true);
+            state
+        });
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             git_store,
             entries: Vec::new(),
             graph_data: None,
-            row_graphs: Vec::new(),
+            table_interaction_state,
             revset_editor: None,
             current_revset: None,
             loading: false,
@@ -174,10 +172,6 @@ impl JjLog {
                         graph_data.add_commits(&commits);
                         graph_data
                     });
-                this.row_graphs = match &graph_data {
-                    Some(graph) => build_row_graphs(graph, entries.len()),
-                    None => Vec::new(),
-                };
                 this.entries = entries;
                 this.graph_data = graph_data;
                 this.loading = false;
@@ -189,138 +183,279 @@ impl JjLog {
         .detach();
     }
 
-}
-    /// Builds per-row graph state from `graph_data`: walks each lane line
-    /// from its child column at the first row, accumulating the column that
-    /// passes through each row; a `Curve` landing on a row becomes that
-    /// row's bend. Placeholders (`usize::MAX`) in unfinished lines are
-    /// clamped to the row count so nothing spills into later rows.
-    fn build_row_graphs(graph: &GraphData, row_count: usize) -> Vec<RowGraph> {
-        let mut row_graphs = vec![RowGraph::default(); row_count];
-        for (ix, commit) in graph.commits.iter().enumerate() {
-            row_graphs[ix].node_lane = commit.lane;
-            row_graphs[ix].color_idx = commit.color_idx;
-        }
-        for line in &graph.lines {
-            if line.full_interval.start >= row_count {
-                continue;
-            }
-            let mut current_column = line.child_column;
-            let mut current_row = line.full_interval.start;
-            for segment in &line.segments {
-                match segment {
-                    CommitLineSegment::Straight { to_row } => {
-                        let to_row = (*to_row).min(row_count);
-                        if current_row < to_row {
-                            for row in current_row..to_row {
-                                row_graphs[row].passes.push(current_column);
-                            }
-                        }
-                        current_row = to_row;
-                    }
-                    CommitLineSegment::Curve { to_column, on_row, .. } => {
-                        let on_row = (*on_row).min(row_count);
-                        if current_row < on_row {
-                            for row in current_row..on_row {
-                                row_graphs[row].passes.push(current_column);
-                            }
-                        }
-                        if current_row < row_count {
-                            row_graphs[current_row]
-                                .bend = Some((current_column, *to_column));
-                        }
-                        current_column = *to_column;
-                        current_row = on_row;
-                    }
-                }
-            }
-        }
-        row_graphs
+    /// Row height mirroring GitGraph's: text line height plus vertical
+    /// padding, scale-rounded so the canvas and the table agree on row
+    /// geometry.
+    fn row_height(window: &Window, _cx: &App) -> Pixels {
+        let rem_size = window.rem_size();
+        let line_height = window.text_style().line_height_in_pixels(rem_size);
+        let raw = line_height + ROW_VERTICAL_PADDING;
+        let scale = window.scale_factor();
+
+        (raw * scale).round() / scale
     }
 
-    /// Renders a 24px-wide graph cell for one row: the lanes that pass
-    /// through as vertical strokes, the bend as a diagonal, and the node as
-    /// a filled accent circle at the row center.
-    fn render_graph_cell(
-        row_graph: RowGraph,
-        window: &mut Window,
-        cx: &mut App,
+    /// Paints the lane graph over the table's visible rows, synced to the
+    /// table's scroll state exactly like GitGraph: rows and lanes are shifted
+    /// by the table's scroll offset and only the visible range is painted.
+    /// Uses GitGraph's Straight/Curve segments, per-lane accent colors and
+    /// solid commit dots.
+    fn render_graph_canvas(
+        &self,
+        graph_data: &GraphData,
+        row_height: Pixels,
+        graph_width: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        const CELL_WIDTH: Pixels = px(24.0);
-        const COLUMN_WIDTH: Pixels = px(18.0);
-        const NODE_RADIUS: Pixels = px(3.5);
-        const LINE_WIDTH: Pixels = px(1.5);
+        let table_state = self.table_interaction_state.read(cx);
+        let viewport_height = table_state
+            .scroll_handle
+            .0
+            .borrow()
+            .last_item_size
+            .map(|size| size.item.height)
+            .unwrap_or(window.viewport_size().height);
+        let commit_count = graph_data.commits.len();
 
-        canvas(
+        let content_height = row_height * commit_count;
+        let max_scroll = (content_height - viewport_height).max(px(0.));
+        let scroll_offset_y = (-table_state.scroll_offset().y).clamp(px(0.), max_scroll);
+
+        let first_visible_row = (scroll_offset_y / row_height).floor() as usize;
+        let vertical_scroll_offset = scroll_offset_y - (first_visible_row as f32 * row_height);
+
+        let visible_row_count =
+            ((viewport_height / row_height).ceil() as usize).min(commit_count);
+        let last_visible_row = first_visible_row + visible_row_count + 1;
+        let viewport_range = first_visible_row
+            .min(commit_count.saturating_sub(1))
+            ..last_visible_row.min(commit_count);
+        let rows = graph_data.commits[viewport_range.clone()].to_vec();
+        let commit_lines: Vec<_> = graph_data
+            .lines
+            .iter()
+            .filter(|line| {
+                line.full_interval.start <= viewport_range.end
+                    && line.full_interval.end >= viewport_range.start
+            })
+            .cloned()
+            .collect();
+
+        gpui::canvas(
             move |_bounds, _window, _cx| {},
             move |bounds: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
-                let text_color = cx.theme().colors().text;
-                let accent_colors = cx.theme().accents();
-                let lane_x = |lane: usize| -> Pixels {
-                    bounds.origin.x + lane as f32 * COLUMN_WIDTH + COLUMN_WIDTH / 2.0
-                };
+                window.paint_layer(bounds, |window| {
+                    let accent_colors = cx.theme().accents();
+                    let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
-                // Passing lane lines first (under the node): full-height
-                // vertical strokes in the text color.
-                for &lane in &row_graph.passes {
-                    let mut builder = PathBuilder::stroke(LINE_WIDTH);
-                    builder.move_to(point(lane_x(lane), bounds.top()));
-                    builder.line_to(point(lane_x(lane), bounds.bottom()));
-                    window.paint_path(builder.build().expect("two-point path"), text_color);
-                }
+                    for (row_idx, row) in rows.into_iter().enumerate() {
+                        let row_color = accent_colors.color_for_index(row.color_idx as u32);
+                        let row_y_center =
+                            bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
+                                - vertical_scroll_offset;
 
-                // The bend landing on this row: a diagonal from the source
-                // column at the bottom to the target column at the top.
-                if let Some((from_lane, to_lane)) = row_graph.bend {
-                    let mut builder = PathBuilder::stroke(LINE_WIDTH);
-                    builder.move_to(point(lane_x(from_lane), bounds.bottom()));
-                    builder.line_to(point(lane_x(to_lane), bounds.top()));
-                    window.paint_path(builder.build().expect("two-point path"), text_color);
-                }
+                        let commit_x = lane_center_x(bounds, row.lane as f32);
 
-                // Node on top: filled circle in the lane's accent color.
-                let x = lane_x(row_graph.node_lane);
-                let y = (bounds.top() + bounds.bottom()) / 2.0;
-                let node_bounds = Bounds::new(
-                    point(x - NODE_RADIUS, y - NODE_RADIUS),
-                    gpui::Size::new(NODE_RADIUS * 2.0, NODE_RADIUS * 2.0),
-                );
-                let node_color = accent_colors
-                    .0
-                    .get(row_graph.color_idx)
-                    .copied()
-                    .unwrap_or_default();
-                window.paint_quad(
-                    gpui::fill(node_bounds, node_color).corner_radii(NODE_RADIUS),
-                );
+                        draw_commit_circle(commit_x, row_y_center, row_color, window);
+                    }
+
+                    for line in commit_lines {
+                        let Some((start_segment_idx, start_column)) =
+                            line.get_first_visible_segment_idx(first_visible_row)
+                        else {
+                            continue;
+                        };
+
+                        let line_x = lane_center_x(bounds, start_column as f32);
+
+                        let start_row =
+                            line.full_interval.start as i32 - first_visible_row as i32;
+
+                        let from_y =
+                            bounds.origin.y + start_row as f32 * row_height + row_height / 2.0
+                                - vertical_scroll_offset
+                                + COMMIT_CIRCLE_RADIUS;
+
+                        let mut current_row = from_y;
+                        let mut current_column = line_x;
+
+                        let mut builder = PathBuilder::stroke(LINE_WIDTH);
+                        builder.move_to(point(line_x, from_y));
+
+                        let segments = &line.segments[start_segment_idx..];
+                        let desired_curve_height = row_height / 3.0;
+                        let desired_curve_width = LANE_WIDTH / 3.0;
+
+                        for (segment_idx, segment) in segments.iter().enumerate() {
+                            let is_last = segment_idx + 1 == segments.len();
+
+                            match segment {
+                                CommitLineSegment::Straight { to_row } => {
+                                    let mut dest_row = to_row_center(
+                                        to_row - first_visible_row,
+                                        row_height,
+                                        vertical_scroll_offset,
+                                        bounds,
+                                    );
+                                    if is_last {
+                                        dest_row -= COMMIT_CIRCLE_RADIUS;
+                                    }
+
+                                    let dest_point = point(current_column, dest_row);
+
+                                    current_row = dest_point.y;
+                                    builder.line_to(dest_point);
+                                    builder.move_to(dest_point);
+                                }
+                                CommitLineSegment::Curve {
+                                    to_column,
+                                    on_row,
+                                    curve_kind,
+                                } => {
+                                    let mut to_column =
+                                        lane_center_x(bounds, *to_column as f32);
+
+                                    let mut to_row = to_row_center(
+                                        *on_row - first_visible_row,
+                                        row_height,
+                                        vertical_scroll_offset,
+                                        bounds,
+                                    );
+
+                                    // This means that this branch was a checkout
+                                    let going_right = to_column > current_column;
+                                    let column_shift = if going_right {
+                                        COMMIT_CIRCLE_RADIUS + COMMIT_CIRCLE_STROKE_WIDTH
+                                    } else {
+                                        -COMMIT_CIRCLE_RADIUS - COMMIT_CIRCLE_STROKE_WIDTH
+                                    };
+
+                                    match curve_kind {
+                                        CurveKind::Checkout => {
+                                            if is_last {
+                                                to_column -= column_shift;
+                                            }
+
+                                            let available_curve_width =
+                                                (to_column - current_column).abs();
+                                            let available_curve_height =
+                                                (to_row - current_row).abs();
+                                            let curve_width =
+                                                desired_curve_width.min(available_curve_width);
+                                            let curve_height =
+                                                desired_curve_height.min(available_curve_height);
+                                            let signed_curve_width = if going_right {
+                                                curve_width
+                                            } else {
+                                                -curve_width
+                                            };
+                                            let curve_start =
+                                                point(current_column, to_row - curve_height);
+                                            let curve_end = point(
+                                                current_column + signed_curve_width,
+                                                to_row,
+                                            );
+                                            let curve_control = point(current_column, to_row);
+
+                                            builder.move_to(point(current_column, current_row));
+                                            builder.line_to(curve_start);
+                                            builder.move_to(curve_start);
+                                            builder.curve_to(curve_end, curve_control);
+                                            builder.move_to(curve_end);
+                                            builder.line_to(point(to_column, to_row));
+                                        }
+                                        CurveKind::Merge => {
+                                            if is_last {
+                                                to_row -= COMMIT_CIRCLE_RADIUS;
+                                            }
+
+                                            let merge_start = point(
+                                                current_column + column_shift,
+                                                current_row - COMMIT_CIRCLE_RADIUS,
+                                            );
+                                            let available_curve_width =
+                                                (to_column - merge_start.x).abs();
+                                            let available_curve_height =
+                                                (to_row - merge_start.y).abs();
+                                            let curve_width =
+                                                desired_curve_width.min(available_curve_width);
+                                            let curve_height =
+                                                desired_curve_height.min(available_curve_height);
+                                            let signed_curve_width = if going_right {
+                                                curve_width
+                                            } else {
+                                                -curve_width
+                                            };
+                                            let curve_start = point(
+                                                to_column - signed_curve_width,
+                                                merge_start.y,
+                                            );
+                                            let curve_end = point(
+                                                to_column,
+                                                merge_start.y + curve_height,
+                                            );
+                                            let curve_control = point(to_column, merge_start.y);
+
+                                            builder.move_to(merge_start);
+                                            builder.line_to(curve_start);
+                                            builder.move_to(curve_start);
+                                            builder.curve_to(curve_end, curve_control);
+                                            builder.move_to(curve_end);
+                                            builder.line_to(point(to_column, to_row));
+                                        }
+                                    }
+                                    current_row = to_row;
+                                    current_column = to_column;
+                                    builder.move_to(point(current_column, current_row));
+                                }
+                            }
+                        }
+
+                        builder.close();
+                        lines.entry(line.color_idx).or_default().push(builder);
+                    }
+
+                    for (color_idx, builders) in lines {
+                        let line_color = accent_colors.color_for_index(color_idx as u32);
+
+                        for builder in builders {
+                            if let Ok(path) = builder.build() {
+                                // we paint each color on it's own layer to stop
+                                // overlapping lines of different colors changing
+                                // the color of a line
+                                window.paint_layer(bounds, |window| {
+                                    window.paint_path(path, line_color);
+                                });
+                            }
+                        }
+                    }
+                })
             },
         )
-        .w(CELL_WIDTH)
-        .h(ROW_HEIGHT)
+        .w(graph_width)
+        .h_full()
     }
+}
 
-    /// Formats a unix timestamp as a short relative time: "5s ago",
-    /// "3m ago", "2h ago", "4d ago", "3mo ago", "2y ago".
-    fn format_timestamp(timestamp: i64) -> String {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let seconds = now.saturating_sub(timestamp.max(0) as u64) as i64;
-        match seconds {
-            s if s < 60 => format!("{s}s ago"),
-            s if s < 3_600 => format!("{}m ago", s / 60),
-            s if s < 86_400 => format!("{}h ago", s / 3600),
-            s if s < 2_592_000 => format!("{}d ago", s / 86_400),
-            s if s < 31_536_000 => format!("{}mo ago", s / 2_592_000),
-            s => format!("{}y ago", s / 31_536_000),
-        }
-    }
+/// Formats a unix timestamp for display, mirroring GitGraph's local
+/// `format_timestamp`.
+fn format_timestamp(timestamp: i64) -> String {
+    let Ok(datetime) = OffsetDateTime::from_unix_timestamp(timestamp) else {
+        return "Unknown".to_string();
+    };
+
+    let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let local_datetime = datetime.to_offset(local_offset);
+
+    local_datetime
+        .format(timestamp_format())
+        .unwrap_or_default()
+}
 
 impl Render for JjLog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entries = self.entries.clone();
-        let row_graphs = self.row_graphs.clone();
         if let Some(error) = self.error.as_deref() {
             return v_flex()
                 .size_full()
@@ -339,6 +474,12 @@ impl Render for JjLog {
                 .p_2()
                 .child(Label::new("no jj repository").color(Color::Muted));
         }
+        let Some(graph_data) = self.graph_data.as_ref() else {
+            return v_flex()
+                .size_full()
+                .p_2()
+                .child(Label::new("no jj repository").color(Color::Muted));
+        };
         let item_count = entries.len();
         let revset_editor = if let Some(editor) = self.revset_editor.clone() {
             editor
@@ -404,6 +545,19 @@ impl Render for JjLog {
                 chip
             }))
             .when(saved_revsets.is_empty(), |this| this.hidden());
+
+        let row_height = Self::row_height(window, cx);
+        // `GraphData::max_lanes` is private, so derive the same value from
+        // the commit lanes; GitGraph floors the graph at 6 lanes wide.
+        let lane_count = graph_data
+            .commits
+            .iter()
+            .map(|commit| commit.lane + 1)
+            .max()
+            .unwrap_or(6)
+            .max(6);
+        let graph_width = LANE_WIDTH * lane_count as f32 + LEFT_PADDING * 2.0;
+
         v_flex()
             .flex_1()
             .size_full()
@@ -411,77 +565,135 @@ impl Render for JjLog {
             .child(revset_bar)
             .child(saved_chips)
             .child(
-                uniform_list(
-                "jj_log_list",
-                item_count,
-                move |range, window, cx| {
-                    entries[range.clone()]
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, entry)| {
-                            let index = range.start + ix;
-                            let change_id = entry.change_id.to_string();
-                            let change_short = change_id[..change_id.len().min(8)].to_string();
-                            let bookmarks = entry
-                                .bookmarks
-                                .iter()
-                                .map(|bookmark| bookmark.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let description = entry.description.lines().next().unwrap_or("");
-                            let has_description = !description.is_empty();
-                            let author_name = entry.author_name.to_string();
-                            let timestamp = format_timestamp(entry.commit_timestamp);
-                            h_flex()
-                                .id(("jj-log-item", index))
-                                .w_full()
-                                .h(ROW_HEIGHT)
-                                .items_center()
-                                .child(render_graph_cell(
-                                    row_graphs.get(index).cloned().unwrap_or_default(),
-                                    window,
-                                    cx,
-                                ))
-                                .child(
-                                    h_flex()
-                                        .w_full()
-                                        .px_2()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            Label::new(change_short.as_str()).color(Color::Default),
-                                        )
-                                        .when(!bookmarks.is_empty(), |this| {
-                                            this.child(
-                                                Label::new(bookmarks.as_str()).color(Color::Accent),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .child(Label::new(if has_description {
-                                                    description
-                                                } else {
-                                                    "(no description set)"
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id("jj-log-graph")
+                            .w(graph_width)
+                            .h_full()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .size_full()
+                                    .child(self.render_graph_canvas(
+                                        graph_data,
+                                        row_height,
+                                        graph_width,
+                                        window,
+                                        cx,
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                Table::new(5)
+                                    .interactable(&self.table_interaction_state)
+                                    .hide_row_borders()
+                                    .hide_row_hover()
+                                    .uniform_list(
+                                        "jj-log-rows",
+                                        item_count,
+                                        move |range, window, cx| {
+                                            let row_height = JjLog::row_height(window, cx);
+                                            range
+                                                .map(|idx| {
+                                                    let entry = &entries[idx];
+                                                    let change_id =
+                                                        entry.change_id.to_string();
+                                                    let change_short = change_id
+                                                        [..change_id.len().min(8)]
+                                                        .to_string();
+                                                    let bookmarks = entry
+                                                        .bookmarks
+                                                        .iter()
+                                                        .map(|bookmark| {
+                                                            bookmark.to_string()
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ");
+                                                    let description = entry
+                                                        .description
+                                                        .lines()
+                                                        .next()
+                                                        .unwrap_or("");
+                                                    let has_description =
+                                                        !description.is_empty();
+                                                    let author_name =
+                                                        entry.author_name.to_string();
+                                                    let timestamp =
+                                                        format_timestamp(
+                                                            entry.commit_timestamp,
+                                                        );
+                                                    vec![
+                                                        div()
+                                                            .h(row_height)
+                                                            .px_2()
+                                                            .child(
+                                                                Label::new(change_short)
+                                                                    .color(
+                                                                        Color::Default,
+                                                                    )
+                                                                    .truncate(),
+                                                            )
+                                                            .into_any_element(),
+                                                        div()
+                                                            .h(row_height)
+                                                            .px_2()
+                                                            .min_w_0()
+                                                            .child(
+                                                                Label::new(if has_description {
+                                                                    description
+                                                                } else {
+                                                                    "(no description set)"
+                                                                })
+                                                                .color(if has_description {
+                                                                    Color::Default
+                                                                } else {
+                                                                    Color::Muted
+                                                                })
+                                                                .truncate(),
+                                                            )
+                                                            .into_any_element(),
+                                                        div()
+                                                            .h(row_height)
+                                                            .px_2()
+                                                            .min_w_0()
+                                                            .child(
+                                                                Label::new(bookmarks)
+                                                                    .color(Color::Accent)
+                                                                    .truncate(),
+                                                            )
+                                                            .into_any_element(),
+                                                        div()
+                                                            .h(row_height)
+                                                            .px_2()
+                                                            .child(
+                                                                Label::new(author_name)
+                                                                    .color(Color::Muted)
+                                                                    .truncate(),
+                                                            )
+                                                            .into_any_element(),
+                                                        div()
+                                                            .h(row_height)
+                                                            .px_2()
+                                                            .child(
+                                                                Label::new(timestamp)
+                                                                    .color(Color::Muted)
+                                                                    .truncate(),
+                                                            )
+                                                            .into_any_element(),
+                                                    ]
                                                 })
-                                                .color(if has_description {
-                                                    Color::Default
-                                                } else {
-                                                    Color::Muted
-                                                })),
-                                        )
-                                        .child(Label::new(author_name.as_str()).color(Color::Muted))
-                                        .child(Label::new(timestamp.as_str()).color(Color::Muted)),
-                                )
-                        })
-                        .collect()
-                },
-                )
-                // Plain list: no explicit height, no shared scroll container —
-                // each row's graph cell scrolls with its text.
-                .flex_1(),
+                                                .collect()
+                                        },
+                                    ),
+                            ),
+                    ),
             )
     }
 }
