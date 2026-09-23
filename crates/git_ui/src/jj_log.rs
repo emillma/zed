@@ -61,7 +61,7 @@ impl JjLog {
             graph_data: None,
             revset_editor: None,
             current_revset: None,
-            saved_revsets: Vec::new(),
+            saved_revsets: revset_config::load(),
             loading: false,
             error: None,
             poll_scheduled: false,
@@ -451,6 +451,9 @@ impl Render for JjLog {
                     if let Some(text) = text.filter(|text| !text.is_empty()) {
                         if !this.saved_revsets.contains(&text) {
                             this.saved_revsets.push(text);
+                            if let Err(err) = revset_config::save(&this.saved_revsets) {
+                                log::warn!("failed to save jj revsets: {err}");
+                            }
                             cx.emit(ItemEvent::UpdateTab);
                         }
                         cx.notify();
@@ -489,6 +492,9 @@ impl Render for JjLog {
                         remove.interactivity().on_click(cx.listener(
                             move |this, _, _window, cx| {
                                 this.saved_revsets.retain(|saved| saved != &remove_revset);
+                                if let Err(err) = revset_config::save(&this.saved_revsets) {
+                                    log::warn!("failed to save jj revsets: {err}");
+                                }
                                 cx.emit(ItemEvent::UpdateTab);
                                 cx.notify();
                             },
@@ -659,17 +665,8 @@ impl SerializableItem for JjLog {
             .flatten();
         Task::ready(Ok(cx.new(|cx| {
             let mut this = JjLog::new(git_store, cx);
-            if let Some((saved_revsets, current_revset)) = saved {
-                this.saved_revsets = saved_revsets
-                    .map(|revsets| {
-                        revsets
-                            .lines()
-                            .filter(|revset| !revset.is_empty())
-                            .map(String::from)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                this.current_revset = current_revset;
+            if let Some(Some(current_revset)) = saved {
+                this.current_revset = Some(current_revset);
             }
             this
         })))
@@ -683,12 +680,10 @@ impl SerializableItem for JjLog {
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
         let workspace_id = workspace.database_id()?;
-        let saved_revsets = (!self.saved_revsets.is_empty())
-            .then(|| self.saved_revsets.join("\n"));
         let current_revset = self.current_revset.clone();
         let db = persistence::JjLogDb::global(cx);
         Some(cx.background_spawn(async move {
-            db.save_jj_log(item_id, workspace_id, saved_revsets, current_revset).await
+            db.save_jj_log(item_id, workspace_id, current_revset).await
         }))
     }
 
@@ -723,7 +718,6 @@ mod persistence {
                 ) STRICT;
             ),
             sql!(
-                ALTER TABLE jj_logs ADD COLUMN saved_revsets TEXT;
                 ALTER TABLE jj_logs ADD COLUMN current_revset TEXT;
             ),
         ];
@@ -736,13 +730,12 @@ mod persistence {
             pub async fn save_jj_log(
                 item_id: workspace::ItemId,
                 workspace_id: workspace::WorkspaceId,
-                saved_revsets: Option<String>,
                 current_revset: Option<String>
             ) -> Result<()> {
                 INSERT OR REPLACE INTO jj_logs(
-                    item_id, workspace_id, saved_revsets, current_revset
+                    item_id, workspace_id, current_revset
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?)
             }
         }
 
@@ -750,11 +743,51 @@ mod persistence {
             pub fn get_jj_log(
                 item_id: workspace::ItemId,
                 workspace_id: workspace::WorkspaceId
-            ) -> Result<Option<(Option<String>, Option<String>)>> {
-                SELECT saved_revsets, current_revset
+            ) -> Result<Option<Option<String>>> {
+                SELECT current_revset
                 FROM jj_logs
                 WHERE item_id = ? AND workspace_id = ?
             }
         }
+    }
+}
+
+mod revset_config {
+    /// Saved revsets live in a user-visible config file
+    /// (`~/.config/zed/jj-revsets.json`) rather than the workspace db, so
+    /// they are global, inspectable, and hand-editable.
+    use anyhow::Result;
+    use paths::config_dir;
+    use serde::{Deserialize, Serialize};
+    use std::{fs, path::PathBuf};
+
+    #[derive(Serialize, Deserialize, Default)]
+    struct SavedRevsets {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        saved_revsets: Vec<String>,
+    }
+
+    fn config_path() -> PathBuf {
+        config_dir().join("jj-revsets.json")
+    }
+
+    pub fn load() -> Vec<String> {
+        fs::read_to_string(config_path())
+            .ok()
+            .and_then(|content| serde_json::from_str::<SavedRevsets>(&content).ok())
+            .map(|saved| saved.saved_revsets)
+            .unwrap_or_default()
+    }
+
+    pub fn save(saved_revsets: &[String]) -> Result<()> {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        let json = serde_json::to_string_pretty(&SavedRevsets {
+            saved_revsets: saved_revsets.to_vec(),
+        })?;
+        fs::write(path, json + "\n")?;
+        Ok(())
     }
 }

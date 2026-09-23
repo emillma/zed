@@ -51,6 +51,7 @@ rand.workspace = true
 release_channel.workspace = true
 remote_connection.workspace = true
 schemars.workspace = true
+paths.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
