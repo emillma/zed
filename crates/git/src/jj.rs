@@ -198,20 +198,41 @@ impl JjRepository {
     /// Returns the most recent `limit` revisions, newest first, as log
     /// entries for the history panel.
     pub fn log(&self, limit: usize) -> BoxFuture<'_, Result<Vec<JjLogEntry>>> {
+        self.log_revset_inner(None, limit)
+    }
+
+    /// Returns up to `limit` revisions matching `revset`, newest first, as
+    /// log entries for the graph panel's revset search. On failure the error
+    /// carries jj's full stderr so the UI can show its explanation.
+    pub fn log_revset(
+        &self,
+        revset: String,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<JjLogEntry>>> {
+        self.log_revset_inner(Some(revset), limit)
+    }
+
+    fn log_revset_inner(
+        &self,
+        revset: Option<String>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<JjLogEntry>>> {
         let jj = self.jj_binary.clone();
-        let limit = limit.to_string();
+        let mut args: Vec<String> = vec!["log".into()];
+        if let Some(revset) = revset {
+            args.push("-r".into());
+            args.push(revset);
+        }
+        args.extend([
+            "-n".into(),
+            limit.to_string(),
+            "--no-graph".into(),
+            "-T".into(),
+            LOG_TEMPLATE.into(),
+        ]);
         self.executor
             .spawn(async move {
-                let output = jj
-                    .run_read_only(&[
-                        "log",
-                        "-n",
-                        limit.as_str(),
-                        "--no-graph",
-                        "-T",
-                        LOG_TEMPLATE,
-                    ])
-                    .await?;
+                let output = jj.run_read_only(&args).await?;
                 Ok(parse_log_output(&output))
             })
             .boxed()
