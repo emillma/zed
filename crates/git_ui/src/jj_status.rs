@@ -1,7 +1,8 @@
-use gpui::{
-    App, Context, Entity, Empty, Render, SharedString, Subscription, Window,
+use gpui::{App, Context, Empty, Entity, Render, SharedString, Subscription, Window};
+use project::{
+    Project,
+    git_store::{GitStore, GitStoreEvent, RepositoryEvent},
 };
-use project::{Project, git_store::{GitStore, GitStoreEvent, RepositoryEvent}};
 use std::time::{Duration, Instant};
 use ui::prelude::*;
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
@@ -138,7 +139,9 @@ impl Render for JjStatusIndicator {
         let Some(text) = &self.text else {
             return Empty.into_any_element();
         };
-        Label::new(text.clone()).size(LabelSize::Small).into_any_element()
+        Label::new(text.clone())
+            .size(LabelSize::Small)
+            .into_any_element()
     }
 }
 

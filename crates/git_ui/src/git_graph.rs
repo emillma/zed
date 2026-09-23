@@ -834,7 +834,10 @@ pub(crate) struct CommitLine {
 }
 
 impl CommitLine {
-    pub(crate) fn get_first_visible_segment_idx(&self, first_visible_row: usize) -> Option<(usize, usize)> {
+    pub(crate) fn get_first_visible_segment_idx(
+        &self,
+        first_visible_row: usize,
+    ) -> Option<(usize, usize)> {
         if first_visible_row > self.full_interval.end {
             return None;
         } else if first_visible_row <= self.full_interval.start {
@@ -1242,7 +1245,12 @@ pub(crate) fn to_row_center(
     bounds.origin.y + to_row as f32 * row_height + row_height / 2.0 - scroll_offset
 }
 
-pub(crate) fn draw_commit_circle(center_x: Pixels, center_y: Pixels, color: Hsla, window: &mut Window) {
+pub(crate) fn draw_commit_circle(
+    center_x: Pixels,
+    center_y: Pixels,
+    color: Hsla,
+    window: &mut Window,
+) {
     let radius = COMMIT_CIRCLE_RADIUS;
 
     // A corner-radius quad instead of a tessellated path: the quad shader
@@ -7662,5 +7670,4 @@ mod tests {
         assert!(graph_data.parent_to_lanes.is_empty());
         assert_eq!(graph_data.lines.len(), 4);
     }
-
 }
