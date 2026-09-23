@@ -1,15 +1,15 @@
-use anyhow::Result;
 use crate::git_graph::{
-    CurveKind, CommitLineSegment, GraphData, accent_colors_count, draw_commit_circle,
-    lane_center_x, timestamp_format, to_row_center, COMMIT_CIRCLE_RADIUS,
-    COMMIT_CIRCLE_STROKE_WIDTH, LANE_WIDTH, LEFT_PADDING, LINE_WIDTH,
+    COMMIT_CIRCLE_RADIUS, COMMIT_CIRCLE_STROKE_WIDTH, CommitLineSegment, CurveKind, GraphData,
+    LANE_WIDTH, LEFT_PADDING, LINE_WIDTH, accent_colors_count, draw_commit_circle, lane_center_x,
+    timestamp_format, to_row_center,
 };
 use crate::jj_settings::JjSettings;
+use anyhow::Result;
 use editor::Editor;
-use git::{jj::JjLogEntry, repository::InitialGraphCommitData, Oid};
+use git::{Oid, jj::JjLogEntry, repository::InitialGraphCommitData};
 use gpui::{
     App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, PathBuilder, Render,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, px, point,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, point, px,
 };
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
 use settings::Settings as _;
@@ -60,7 +60,8 @@ pub struct JjLog {
 impl JjLog {
     pub fn new(git_store: Entity<GitStore>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&git_store, Self::on_git_store_event);
-        cx.observe_global::<JjSettings>(|_, cx| cx.notify()).detach();
+        cx.observe_global::<JjSettings>(|_, cx| cx.notify())
+            .detach();
         let table_interaction_state = cx.new(|cx| {
             let mut state = TableInteractionState::new(cx);
             state.focus_handle = state.focus_handle.tab_index(1).tab_stop(true);
@@ -148,30 +149,26 @@ impl JjLog {
                 }
                 // Lane data is only built on a successful fetch; jj log
                 // entries arrive children-first, the order add_commits expects.
-                let graph_data = error
-                    .as_ref()
-                    .is_none()
-                    .then(|| {
-                        let commits: Vec<Arc<InitialGraphCommitData>> = entries
-                            .iter()
-                            .filter_map(|entry| {
-                                let sha = Oid::from_str(&entry.commit_id).ok()?;
-                                Some(Arc::new(InitialGraphCommitData {
-                                    sha,
-                                    parents: entry
-                                        .parents
-                                        .iter()
-                                        .filter_map(|parent| Oid::from_str(parent).ok())
-                                        .collect(),
-                                    ref_names: entry.bookmarks.clone(),
-                                }))
-                            })
-                            .collect();
-                        let mut graph_data =
-                            GraphData::new(accent_colors_count(&cx.theme().accents()));
-                        graph_data.add_commits(&commits);
-                        graph_data
-                    });
+                let graph_data = error.as_ref().is_none().then(|| {
+                    let commits: Vec<Arc<InitialGraphCommitData>> = entries
+                        .iter()
+                        .filter_map(|entry| {
+                            let sha = Oid::from_str(&entry.commit_id).ok()?;
+                            Some(Arc::new(InitialGraphCommitData {
+                                sha,
+                                parents: entry
+                                    .parents
+                                    .iter()
+                                    .filter_map(|parent| Oid::from_str(parent).ok())
+                                    .collect(),
+                                ref_names: entry.bookmarks.clone(),
+                            }))
+                        })
+                        .collect();
+                    let mut graph_data = GraphData::new(accent_colors_count(&cx.theme().accents()));
+                    graph_data.add_commits(&commits);
+                    graph_data
+                });
                 this.entries = entries;
                 this.graph_data = graph_data;
                 this.loading = false;
@@ -225,11 +222,9 @@ impl JjLog {
         let first_visible_row = (scroll_offset_y / row_height).floor() as usize;
         let vertical_scroll_offset = scroll_offset_y - (first_visible_row as f32 * row_height);
 
-        let visible_row_count =
-            ((viewport_height / row_height).ceil() as usize).min(commit_count);
+        let visible_row_count = ((viewport_height / row_height).ceil() as usize).min(commit_count);
         let last_visible_row = first_visible_row + visible_row_count + 1;
-        let viewport_range = first_visible_row
-            .min(commit_count.saturating_sub(1))
+        let viewport_range = first_visible_row.min(commit_count.saturating_sub(1))
             ..last_visible_row.min(commit_count);
         let rows = graph_data.commits[viewport_range.clone()].to_vec();
         let commit_lines: Vec<_> = graph_data
@@ -269,8 +264,7 @@ impl JjLog {
 
                         let line_x = lane_center_x(bounds, start_column as f32);
 
-                        let start_row =
-                            line.full_interval.start as i32 - first_visible_row as i32;
+                        let start_row = line.full_interval.start as i32 - first_visible_row as i32;
 
                         let from_y =
                             bounds.origin.y + start_row as f32 * row_height + row_height / 2.0
@@ -313,8 +307,7 @@ impl JjLog {
                                     on_row,
                                     curve_kind,
                                 } => {
-                                    let mut to_column =
-                                        lane_center_x(bounds, *to_column as f32);
+                                    let mut to_column = lane_center_x(bounds, *to_column as f32);
 
                                     let mut to_row = to_row_center(
                                         *on_row - first_visible_row,
@@ -352,10 +345,8 @@ impl JjLog {
                                             };
                                             let curve_start =
                                                 point(current_column, to_row - curve_height);
-                                            let curve_end = point(
-                                                current_column + signed_curve_width,
-                                                to_row,
-                                            );
+                                            let curve_end =
+                                                point(current_column + signed_curve_width, to_row);
                                             let curve_control = point(current_column, to_row);
 
                                             builder.move_to(point(current_column, current_row));
@@ -391,10 +382,8 @@ impl JjLog {
                                                 to_column - signed_curve_width,
                                                 merge_start.y,
                                             );
-                                            let curve_end = point(
-                                                to_column,
-                                                merge_start.y + curve_height,
-                                            );
+                                            let curve_end =
+                                                point(to_column, merge_start.y + curve_height);
                                             let curve_control = point(to_column, merge_start.y);
 
                                             builder.move_to(merge_start);
@@ -500,10 +489,7 @@ impl Render for JjLog {
             .gap_2()
             .child(revset_editor)
             .child({
-                let mut apply_button = div()
-                    .px_2()
-                    .text_sm()
-                    .child(Label::new("Apply"));
+                let mut apply_button = div().px_2().text_sm().child(Label::new("Apply"));
                 apply_button
                     .interactivity()
                     .on_click(cx.listener(|this, _, _window, cx| {
@@ -527,23 +513,28 @@ impl Render for JjLog {
             .py(px(2.))
             .gap_1()
             .flex_wrap()
-            .children(saved_revsets.iter().cloned().enumerate().map(|(ix, revset)| {
-                let click_revset = revset.clone();
-                let mut chip = div().px_2().text_sm().child(Label::new(revset));
-                chip.interactivity().on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        if let Some(editor) = this.revset_editor.as_ref() {
-                            editor.update(cx, |editor, cx| {
-                                editor.set_text(click_revset.clone(), window, cx)
-                            });
-                        }
-                        this.current_revset = Some(click_revset.clone());
-                        cx.emit(ItemEvent::UpdateTab);
-                        this.schedule_poll(cx);
-                    },
-                ));
-                chip
-            }))
+            .children(
+                saved_revsets
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(ix, revset)| {
+                        let click_revset = revset.clone();
+                        let mut chip = div().px_2().text_sm().child(Label::new(revset));
+                        chip.interactivity()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(editor) = this.revset_editor.as_ref() {
+                                    editor.update(cx, |editor, cx| {
+                                        editor.set_text(click_revset.clone(), window, cx)
+                                    });
+                                }
+                                this.current_revset = Some(click_revset.clone());
+                                cx.emit(ItemEvent::UpdateTab);
+                                this.schedule_poll(cx);
+                            }));
+                        chip
+                    }),
+            )
             .when(saved_revsets.is_empty(), |this| this.hidden());
 
         let row_height = Self::row_height(window, cx);
@@ -560,37 +551,31 @@ impl Render for JjLog {
 
         v_flex()
             .flex_1()
+            .min_w_0()
             .size_full()
-            .overflow_hidden()
             .child(revset_bar)
             .child(saved_chips)
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .id("jj-log-graph")
-                            .w(graph_width)
-                            .h_full()
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .size_full()
-                                    .child(self.render_graph_canvas(
-                                        graph_data,
-                                        row_height,
-                                        graph_width,
-                                        window,
-                                        cx,
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
+                div().relative().flex_1().w_full().overflow_hidden().child(
+                    h_flex()
+                        .size_full()
+                        .child(
+                            div()
+                                .id("jj-log-graph")
+                                .w(graph_width)
+                                .h_full()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(div().size_full().child(self.render_graph_canvas(
+                                    graph_data,
+                                    row_height,
+                                    graph_width,
+                                    window,
+                                    cx,
+                                ))),
+                        )
+                        .child(
+                            div().flex_1().h_full().min_w_0().child(
                                 Table::new(5)
                                     .interactable(&self.table_interaction_state)
                                     .hide_row_borders()
@@ -603,17 +588,14 @@ impl Render for JjLog {
                                             range
                                                 .map(|idx| {
                                                     let entry = &entries[idx];
-                                                    let change_id =
-                                                        entry.change_id.to_string();
+                                                    let change_id = entry.change_id.to_string();
                                                     let change_short = change_id
                                                         [..change_id.len().min(8)]
                                                         .to_string();
                                                     let bookmarks = entry
                                                         .bookmarks
                                                         .iter()
-                                                        .map(|bookmark| {
-                                                            bookmark.to_string()
-                                                        })
+                                                        .map(|bookmark| bookmark.to_string())
                                                         .collect::<Vec<_>>()
                                                         .join(", ");
                                                     let description = entry
@@ -621,23 +603,17 @@ impl Render for JjLog {
                                                         .lines()
                                                         .next()
                                                         .unwrap_or("");
-                                                    let has_description =
-                                                        !description.is_empty();
-                                                    let author_name =
-                                                        entry.author_name.to_string();
+                                                    let has_description = !description.is_empty();
+                                                    let author_name = entry.author_name.to_string();
                                                     let timestamp =
-                                                        format_timestamp(
-                                                            entry.commit_timestamp,
-                                                        );
+                                                        format_timestamp(entry.commit_timestamp);
                                                     vec![
                                                         div()
                                                             .h(row_height)
                                                             .px_2()
                                                             .child(
                                                                 Label::new(change_short)
-                                                                    .color(
-                                                                        Color::Default,
-                                                                    )
+                                                                    .color(Color::Default)
                                                                     .truncate(),
                                                             )
                                                             .into_any_element(),
@@ -693,7 +669,8 @@ impl Render for JjLog {
                                         },
                                     ),
                             ),
-                    ),
+                        ),
+                ),
             )
     }
 }
