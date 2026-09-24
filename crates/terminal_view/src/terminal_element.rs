@@ -900,8 +900,11 @@ impl TerminalElement {
             thickness: Pixels::from(1.0),
         });
 
+        // Bold cells render at semibold: full BOLD (700) next to the editor's
+        // light buffer font reads as "wider" in the terminal, and the weight is
+        // not configurable (terminal.font_weight only affects non-bold text).
         let weight = if cell.is_bold() {
-            FontWeight::BOLD
+            FontWeight::SEMIBOLD
         } else {
             text_style.font_weight
         };
