@@ -345,3 +345,93 @@ impl PathBuilder {
         path
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dumps the stroke tessellation of the GitGraph "checkout curve" shape:
+    /// vertical run -> quadratic bend (horizontal end tangent) -> horizontal run.
+    ///
+    /// Used to diagnose the near-horizontal blob artifact: verifies that the
+    /// tessellated strip stays within ~half the line width of the centerline.
+    #[test]
+    fn lane_tessellation_width() {
+        // Geometry mirrors crates/git_ui/src/git_graph.rs checkout-curve drawing.
+        let x0 = 100.0;
+        let y_top = 50.0;
+        let to_row_y = 200.0;
+        let curve_h = 8.0; // row_height / 3
+        let curve_w = 16.0 / 3.0; // LANE_WIDTH / 3
+        let p_start = (x0, to_row_y - curve_h);
+        let p_end = (x0 + curve_w, to_row_y);
+        let p_ctrl = (x0, to_row_y);
+
+        let mut builder = PathBuilder::stroke(px(1.5));
+        builder.move_to(point(px(x0), px(y_top)));
+        builder.line_to(point(px(p_start.0), px(p_start.1)));
+        builder.move_to(point(px(p_start.0), px(p_start.1)));
+        builder.curve_to(
+            point(px(p_end.0), px(p_end.1)),
+            point(px(p_ctrl.0), px(p_ctrl.1)),
+        );
+        builder.move_to(point(px(p_end.0), px(p_end.1)));
+        builder.line_to(point(px(p_end.0 + 50.0), px(to_row_y)));
+        let path = builder.build().unwrap();
+
+        let curve = |t: f32| {
+            let a = (1.0 - t) * (1.0 - t);
+            let b = 2.0 * t * (1.0 - t);
+            let c = t * t;
+            (
+                a * p_start.0 + b * p_ctrl.0 + c * p_end.0,
+                a * p_start.1 + b * p_ctrl.1 + c * p_end.1,
+            )
+        };
+        let dist_to_centerline = |p: (f32, f32)| {
+            let mut best = f32::INFINITY;
+            for i in 0..=2000 {
+                let t = i as f32 / 2000.0;
+                let (cx, cy) = curve(t);
+                best = best.min(((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt());
+            }
+            best.min((p.0 - x0).abs()) // vertical run at x = x0
+                .min((p.1 - to_row_y).abs()) // horizontal run at y = to_row_y
+        };
+
+        let n = path.vertices.len();
+        assert!(n % 3 == 0);
+        println!("{} vertices, {} triangles", n, n / 3);
+        for i in (0..n).step_by(3) {
+            let xs: Vec<f32> = path.vertices[i..i + 3]
+                .iter()
+                .map(|v| v.xy_position.x.0)
+                .collect();
+            let ys: Vec<f32> = path.vertices[i..i + 3]
+                .iter()
+                .map(|v| v.xy_position.y.0)
+                .collect();
+            let in_bend = xs
+                .iter()
+                .zip(ys.iter())
+                .any(|(x, y)| *x >= 98.0 && *x <= 108.0 && *y >= 189.0 && *y <= 202.0);
+            if in_bend {
+                let dmax = [0, 1, 2]
+                    .map(|j| dist_to_centerline((xs[j], ys[j])))
+                    .into_iter()
+                    .fold(0.0_f32, f32::max);
+                println!(
+                    "tri {:3}: [{:7.3},{:7.3}] [{:7.3},{:7.3}] [{:7.3},{:7.3}] max_dist={:6.3}",
+                    i / 3,
+                    xs[0],
+                    ys[0],
+                    xs[1],
+                    ys[1],
+                    xs[2],
+                    ys[2],
+                    dmax
+                );
+            }
+        }
+    }
+}

@@ -7782,6 +7782,7 @@ dependencies = [
  "log",
  "naga",
  "parking_lot",
+ "pollster 0.4.0",
  "profiling",
  "raw-window-handle",
  "smallvec",

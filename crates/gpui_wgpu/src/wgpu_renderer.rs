@@ -2199,6 +2199,9 @@ impl RenderingParameters {
 }
 
 #[cfg(test)]
+mod path_rasterization_repro;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite, Underline};
