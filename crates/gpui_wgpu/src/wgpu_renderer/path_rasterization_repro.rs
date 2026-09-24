@@ -102,12 +102,10 @@ fn readback(
     buffer.map_async(wgpu::MapMode::Read, 0..size, move |r| {
         let _ = tx.send(r);
     });
-    eprintln!("[stage] map_async pending ({} bytes)", size);
     // Headless: no event loop pumps the instance, so poll to deliver the
     // map callback and wait for the copy to complete.
     instance.poll_all(true);
     let _ = rx.recv().expect("map_async callback did not run");
-    eprintln!("[stage] map_async done");
     let data: Vec<u8> = buffer.get_mapped_range(0..size).to_vec();
     buffer.unmap();
     data
@@ -150,7 +148,6 @@ fn rasterize(
     queue.write_buffer(&instance_buffer, 0, unsafe {
         WgpuRenderer::instance_bytes(&vertices)
     });
-    eprintln!("[stage] instance buffer written ({})", vertices_size);
 
     // --- 2. Globals, with the same offsets as `WgpuRenderer::new`. ---
     let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
@@ -232,7 +229,6 @@ fn rasterize(
         view_formats: &[],
     });
     let intermediate_view = intermediate.create_view(&wgpu::TextureViewDescriptor::default());
-    eprintln!("[stage] textures created");
 
     let msaa_view = if sample_count > 1 {
         Some(
@@ -482,17 +478,14 @@ fn rasterize(
     }
 
     queue.submit([encoder.finish()]);
-    eprintln!("[stage] pass recorded + submitted");
 
     let data1 = readback(instance, device, queue, &intermediate, width, height);
-    eprintln!("[stage] intermediate readback done");
     let data2 = readback(instance, device, queue, &final_texture, width, height);
-    eprintln!("[stage] final readback done");
     (data1, data2)
 }
 
 /// Per-region coverage profiles for the lane geometry.
-fn report(label: &str, bytes: &[u8], width: u32, height: u32) {
+fn report(sample_count: u32, label: &str, bytes: &[u8], width: u32, height: u32) {
     assert_eq!(bytes.len(), (width * height * 4) as usize);
     let alpha = |x: u32, y: u32| -> f32 {
         let i = (y as usize * width as usize + x as usize) * 4;
@@ -535,6 +528,14 @@ fn report(label: &str, bytes: &[u8], width: u32, height: u32) {
         join(&horiz_rows)
     );
     eprintln!("  bend area (x97..108, y189..202): {bend:.3} px^2");
+
+    // AA profile at one mid-segment position: per-column alpha across the
+    // vertical stroke's edges (y=100) and per-row alpha across the
+    // horizontal stroke's edges (x=130).
+    let vert_aa: Vec<f32> = (96..=104).map(|x| alpha(x, 100)).collect();
+    let horiz_aa: Vec<f32> = (196..=204).map(|y| alpha(130, y)).collect();
+    eprintln!("profile sc={sample_count} vert: [{}]", join(&vert_aa));
+    eprintln!("profile sc={sample_count} horiz: [{}]", join(&horiz_aa));
 }
 
 #[test]
@@ -578,18 +579,37 @@ fn path_rasterization_lane_coverage() {
     let path = lane_path(width, height);
     eprintln!("{} path vertices", path.vertices.len());
 
-    let supported = [4u32, 2, 1].into_iter().filter(|&n| {
-        adapter
-            .get_texture_format_features(format)
-            .flags
-            .sample_count_supported(n)
-    });
-    for samples in supported {
+    // A color attachment accepts 1 and 4 samples without any device feature;
+    // 2 and 8 additionally require TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+    // which this device does not enable — skip such counts instead of dying
+    // in device validation.
+    let msaa_ok = |n: u32| {
+        n == 1
+            || n == 4
+            || (device
+                .features()
+                .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+                && adapter
+                    .get_texture_format_features(format)
+                    .flags
+                    .sample_count_supported(n))
+    };
+    for samples in [4u32, 2, 1] {
+        if !msaa_ok(samples) {
+            eprintln!("skipping sample_count {samples}: unsupported by this device");
+            continue;
+        }
         let (intermediate, final_) = rasterize(
             &instance, &device, &queue, format, width, height, samples, &path,
         );
         eprintln!("== sample_count {samples} ==");
-        report("intermediate (post-resolve)", &intermediate, width, height);
-        report("final (post-blit)", &final_, width, height);
+        report(
+            samples,
+            "intermediate (post-resolve)",
+            &intermediate,
+            width,
+            height,
+        );
+        report(samples, "final (post-blit)", &final_, width, height);
     }
 }

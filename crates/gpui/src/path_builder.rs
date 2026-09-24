@@ -13,6 +13,10 @@ pub use lyon::tessellation::{FillOptions, FillRule, StrokeOptions};
 
 use crate::{Path, Pixels, Point, point, px};
 
+/// Samples per quadratic/cubic centerline segment when encoding stroke
+/// distances (keeps chord sagitta small for large-radius bends).
+const CENTERLINE_CURVE_SAMPLES: u32 = 32;
+
 /// Style of the PathBuilder
 pub enum PathStyle {
     /// Stroke style
@@ -269,7 +273,7 @@ impl PathBuilder {
             &mut BuffersBuilder::new(&mut buf, |vertex: FillVertex| vertex.position()),
         )?;
 
-        Ok(Self::build_path(buf))
+        Ok(Self::build_path(buf, None))
     }
 
     fn tessellate_stroke(
@@ -315,11 +319,197 @@ impl PathBuilder {
             &mut BuffersBuilder::new(&mut buf, |vertex: StrokeVertex| vertex.position()),
         )?;
 
-        Ok(Self::build_path(buf))
+        let st = Self::stroke_st_positions(path, &buf.vertices, options.line_width);
+        Ok(Self::build_path(buf, st.as_deref()))
+    }
+
+    /// Per-vertex st for stroked tessellation: the signed distance from the
+    /// centerline (normalized by half the stroke width) in x, and st.y == 0.0
+    /// as the stroke-mode flag read by `fs_path_rasterization`. `None` keeps
+    /// the legacy constant st when the width is non-positive or the path has
+    /// no non-degenerate centerline geometry.
+    fn stroke_st_positions(
+        path: &lyon::path::Path,
+        vertices: &[lyon::math::Point],
+        stroke_width: f32,
+    ) -> Option<Vec<Point<f32>>> {
+        let half_width = stroke_width / 2.0;
+        if half_width <= 0.0 {
+            return None;
+        }
+        let polylines = Self::centerline_polylines(path, half_width);
+        if polylines.is_empty() {
+            return None;
+        }
+        Some(
+            vertices
+                .iter()
+                .map(|&p| {
+                    let (dist, side) = Self::signed_side_distance(p, &polylines);
+                    point(side * dist / half_width, 0.0)
+                })
+                .collect(),
+        )
+    }
+
+    /// Per-contour centerline polylines of `path`: straight segments stay
+    /// exact, quadratic/cubic curves are sampled at
+    /// `CENTERLINE_CURVE_SAMPLES` points, and each open contour is extended
+    /// past both ends by `half_width` so round-cap vertices get their true
+    /// perpendicular distance. Zero-length contours are skipped.
+    fn centerline_polylines(
+        path: &lyon::path::Path,
+        half_width: f32,
+    ) -> Vec<Vec<lyon::math::Point>> {
+        let mut polylines: Vec<Vec<lyon::math::Point>> = Vec::new();
+        let mut current: Option<Vec<lyon::math::Point>> = None;
+        for event in path.iter() {
+            match event {
+                lyon::path::PathEvent::Begin { at } => current = Some(vec![at]),
+                lyon::path::PathEvent::Line { from: _, to } => {
+                    if let Some(poly) = current.as_mut() {
+                        poly.push(to);
+                    }
+                }
+                lyon::path::PathEvent::Quadratic { from, ctrl, to } => {
+                    if let Some(poly) = current.as_mut() {
+                        Self::sample_curve(poly, |t| {
+                            let u = 1.0 - t;
+                            (
+                                u * u * from.x + 2.0 * u * t * ctrl.x + t * t * to.x,
+                                u * u * from.y + 2.0 * u * t * ctrl.y + t * t * to.y,
+                            )
+                        });
+                    }
+                }
+                lyon::path::PathEvent::Cubic {
+                    from,
+                    ctrl1,
+                    ctrl2,
+                    to,
+                } => {
+                    if let Some(poly) = current.as_mut() {
+                        Self::sample_curve(poly, |t| {
+                            let u = 1.0 - t;
+                            (
+                                u * u * u * from.x
+                                    + 3.0 * u * u * t * ctrl1.x
+                                    + 3.0 * u * t * t * ctrl2.x
+                                    + t * t * t * to.x,
+                                u * u * u * from.y
+                                    + 3.0 * u * u * t * ctrl1.y
+                                    + 3.0 * u * t * t * ctrl2.y
+                                    + t * t * t * to.y,
+                            )
+                        });
+                    }
+                }
+                lyon::path::PathEvent::End {
+                    last: _,
+                    first,
+                    close,
+                } => {
+                    if let Some(mut poly) = current.take() {
+                        if close && poly.last() != Some(&first) {
+                            // Include the closing edge in distance queries.
+                            poly.push(first);
+                        }
+                        if poly.len() >= 2 && !poly.windows(2).all(|w| w[0] == w[1]) {
+                            Self::extend_ends(&mut poly, half_width, !close);
+                            polylines.push(poly);
+                        }
+                    }
+                }
+            }
+        }
+        polylines
+    }
+
+    /// Appends `CENTERLINE_CURVE_SAMPLES` samples of the curve `f`, t in
+    /// (0, 1]; t = 0 is the current polyline end.
+    fn sample_curve(poly: &mut Vec<lyon::math::Point>, f: impl Fn(f32) -> (f32, f32)) {
+        for i in 1..=CENTERLINE_CURVE_SAMPLES {
+            let (x, y) = f(i as f32 / CENTERLINE_CURVE_SAMPLES as f32);
+            poly.push(lyon::math::point(x, y));
+        }
+    }
+
+    /// Extends an open polyline past both ends by `half_width` along the
+    /// first/last non-degenerate segment, so the round caps sit on the
+    /// extended centerline.
+    fn extend_ends(poly: &mut Vec<lyon::math::Point>, half_width: f32, open: bool) {
+        if !open {
+            return;
+        }
+        // Skip coincident leading/trailing points so `start`/`end` bound the
+        // first/last real segment.
+        let mut start = 0;
+        while start + 1 < poly.len() && poly[start] == poly[start + 1] {
+            start += 1;
+        }
+        let mut end = poly.len() - 1;
+        while end > 0 && poly[end] == poly[end - 1] {
+            end -= 1;
+        }
+        if start + 1 < poly.len() {
+            let d = poly[start + 1] - poly[start];
+            if d.length() > 0.0 {
+                poly[start] -= d / d.length() * half_width;
+            }
+        }
+        if end > 0 {
+            let d = poly[end] - poly[end - 1];
+            if d.length() > 0.0 {
+                poly[end] += d / d.length() * half_width;
+            }
+        }
+    }
+
+    /// The distance from `p` to the nearest centerline segment over all
+    /// contours, plus the side: the sign of the cross product of the segment
+    /// direction with (p - nearest point).
+    fn signed_side_distance(
+        p: lyon::math::Point,
+        polylines: &[Vec<lyon::math::Point>],
+    ) -> (f32, f32) {
+        let mut best: Option<(f32, f32)> = None;
+        for poly in polylines {
+            for w in poly.windows(2) {
+                let (d, side) = Self::segment_distance_side(p, w[0], w[1]);
+                match best {
+                    None => best = Some((d, side)),
+                    Some((bd, _)) if d < bd => best = Some((d, side)),
+                    _ => {}
+                }
+            }
+        }
+        best.unwrap_or((0.0, 0.0))
+    }
+
+    /// The distance from `p` to the segment [a, b], plus the sign of the
+    /// cross product of the segment direction with (p - nearest point).
+    fn segment_distance_side(
+        p: lyon::math::Point,
+        a: lyon::math::Point,
+        b: lyon::math::Point,
+    ) -> (f32, f32) {
+        let ab = b - a;
+        let len2 = ab.dot(ab);
+        if len2 == 0.0 {
+            return ((p - a).length(), 0.0);
+        }
+        let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+        let to_p = p - (a + ab * t);
+        (to_p.length(), ab.cross(to_p).signum())
     }
 
     /// Builds a [`Path`] from a [`lyon::tessellation::VertexBuffers`].
-    pub fn build_path(buf: VertexBuffers<lyon::math::Point, u16>) -> Path<Pixels> {
+    /// `st` overrides the per-vertex st position; `None` keeps the legacy
+    /// constant `(0, 1)`.
+    pub fn build_path(
+        buf: VertexBuffers<lyon::math::Point, u16>,
+        st: Option<&[Point<f32>]>,
+    ) -> Path<Pixels> {
         if buf.vertices.is_empty() {
             return Path::new(Point::default());
         }
@@ -336,10 +526,11 @@ impl PathBuilder {
             let v1 = buf.vertices[i1];
             let v2 = buf.vertices[i2];
 
-            path.push_triangle(
-                (v0.into(), v1.into(), v2.into()),
-                (point(0., 1.), point(0., 1.), point(0., 1.)),
-            );
+            let st0 = st.map_or(point(0., 1.), |st| st[i0]);
+            let st1 = st.map_or(point(0., 1.), |st| st[i1]);
+            let st2 = st.map_or(point(0., 1.), |st| st[i2]);
+
+            path.push_triangle((v0.into(), v1.into(), v2.into()), (st0, st1, st2));
         }
 
         path
@@ -432,6 +623,53 @@ mod tests {
                     dmax
                 );
             }
+        }
+    }
+
+    /// Verifies the stroke st encoding: st.y == 0.0 (stroke-mode flag) on
+    /// every vertex, signed |st.x| reaches 1.0 on both side edges, and no
+    /// vertex overshoots the stroke. Fills keep the legacy st == (0, 1).
+    #[test]
+    fn stroke_st_encoding() {
+        let mut builder = PathBuilder::stroke(px(2.0));
+        builder.move_to(point(px(0.0), px(0.0)));
+        builder.line_to(point(px(10.0), px(0.0)));
+        let path = builder.build().unwrap();
+        assert!(!path.vertices.is_empty());
+
+        let mut min_abs_st = f32::MAX;
+        for v in &path.vertices {
+            assert_eq!(v.st_position.y, 0.0);
+            assert!(
+                v.st_position.x.abs() <= 1.0 + 1e-3,
+                "stroke vertex overshoots the edge: {:?}",
+                v.st_position
+            );
+            min_abs_st = min_abs_st.min(v.st_position.x.abs());
+        }
+        assert!(min_abs_st <= 1.0 + 1e-3);
+        assert!(
+            path.vertices
+                .iter()
+                .any(|v| (v.st_position.x - 1.0).abs() <= 1e-3),
+            "no vertex at st.x ~= +1.0 (right edge)"
+        );
+        assert!(
+            path.vertices
+                .iter()
+                .any(|v| (v.st_position.x + 1.0).abs() <= 1e-3),
+            "no vertex at st.x ~= -1.0 (left edge)"
+        );
+
+        let mut builder = PathBuilder::fill();
+        builder.move_to(point(px(0.0), px(0.0)));
+        builder.line_to(point(px(10.0), px(0.0)));
+        builder.line_to(point(px(5.0), px(5.0)));
+        builder.close();
+        let filled = builder.build().unwrap();
+        assert!(!filled.vertices.is_empty());
+        for v in &filled.vertices {
+            assert_eq!(v.st_position, point(0.0, 1.0));
         }
     }
 }

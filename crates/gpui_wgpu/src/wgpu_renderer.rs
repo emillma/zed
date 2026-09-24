@@ -2169,6 +2169,10 @@ impl RenderingParameters {
             .into_iter()
             .find(|&n| format_features.flags.sample_count_supported(n))
             .unwrap_or(1);
+        log::info!(
+            "Zed: path rasterization MSAA sample count: {}",
+            path_sample_count
+        );
 
         let gamma = env::var("ZED_FONTS_GAMMA")
             .ok()

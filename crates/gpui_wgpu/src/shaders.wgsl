@@ -1089,14 +1089,22 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     let bounds = v.bounds;
 
     var alpha: f32;
-    if (length(vec2<f32>(dx.x, dy.x)) < 0.001) {
-        // If the gradient is too small, return a solid color.
-        alpha = 1.0;
+    if (input.st_position.y < 0.5) {
+        // Stroked path: st.x is the signed distance from the path centerline,
+        // normalized by the half stroke width (±1 on the two edges, 0 on the
+        // centerline). st.y == 0.0 is the stroke-mode flag.
+        let d = abs(input.st_position.x);
+        let gradient_length = length(vec2<f32>(dx.x, dy.x));
+        if (gradient_length < 0.001) {
+            alpha = 1.0;
+        } else {
+            // Distance in pixels to the nearest stroke edge, converted to
+            // analytic coverage at the fragment (0.5 at the edge, ramping to
+            // 0 half a pixel outside and 1 half a pixel inside).
+            alpha = saturate(0.5 + (1.0 - d) / gradient_length);
+        }
     } else {
-        let gradient = 2.0 * input.st_position.xx * vec2<f32>(dx.x, dy.x) - vec2<f32>(dx.y, dy.y);
-        let f = input.st_position.x * input.st_position.x - input.st_position.y;
-        let distance = f / length(gradient);
-        alpha = saturate(0.5 - distance);
+        alpha = 1.0; // Legacy: constant-st paths (fills) stay fully covered.
     }
     let prepared_gradient = prepare_gradient_color(
         background.tag,
