@@ -17,6 +17,17 @@ use crate::{Path, Pixels, Point, point, px};
 /// distances (keeps chord sagitta small for large-radius bends).
 const CENTERLINE_CURVE_SAMPLES: u32 = 32;
 
+/// Stroke tessellation is displaced outward by this many logical px on each
+/// side. The analytic AA ramp in `fs_path_rasterization` reaches 0.5 device
+/// px *outside* each true edge, but the GPU emits no fragment for a pixel
+/// whose center lies on the quad edge — so without dilation the outer row of
+/// the ramp is missing (profile `[0.5,1,1,0]` instead of `[0.5,1,1,0.5]`).
+/// Dilating the geometry guarantees fragments exist across the whole ramp;
+/// the per-vertex `st` is then derived from these dilated positions, so the
+/// analytic formula (unchanged) computes exact coverage for the *undilated*
+/// stroke.
+const STROKE_AA_DILATION: f32 = 1.0;
+
 /// Style of the PathBuilder
 pub enum PathStyle {
     /// Stroke style
@@ -312,11 +323,19 @@ impl PathBuilder {
         let mut buf: VertexBuffers<lyon::math::Point, u16> = VertexBuffers::new();
         let mut tessellator = StrokeTessellator::new();
 
-        // Compute the tessellation.
+        // Compute the tessellation. Each vertex is displaced outward along
+        // its unit normal by `STROKE_AA_DILATION` (a `lyon` stroke normal has
+        // unit length, so this inflates the stroke by that much on each side)
+        // so the rasterized geometry covers the whole analytic AA ramp. The
+        // per-vertex `st` below is derived from these dilated positions, so
+        // `st.x` at the dilated edge is ±(1 + STROKE_AA_DILATION/half_width)
+        // while the true edges stay at ±1 — do not hand-edit the values.
         tessellator.tessellate_path(
             path,
             options,
-            &mut BuffersBuilder::new(&mut buf, |vertex: StrokeVertex| vertex.position()),
+            &mut BuffersBuilder::new(&mut buf, |vertex: StrokeVertex| {
+                vertex.position() + vertex.normal().normalize() * STROKE_AA_DILATION
+            }),
         )?;
 
         let st = Self::stroke_st_positions(path, &buf.vertices, options.line_width);
@@ -593,6 +612,22 @@ mod tests {
         let n = path.vertices.len();
         assert!(n % 3 == 0);
         println!("{} vertices, {} triangles", n, n / 3);
+        // Dilation grows the geometry: the farthest vertex now sits
+        // `STROKE_AA_DILATION` past the undilated edge (span
+        // 2*(half_width + k) instead of 2*half_width), while the analytic
+        // width (|st.x| = 1) is unchanged. Verify the vertex span grew.
+        let hw = 0.75; // px(1.5) stroke
+        let max_dist = (0..n).fold(0.0_f32, |m, i| {
+            m.max(dist_to_centerline((
+                path.vertices[i].xy_position.x.0,
+                path.vertices[i].xy_position.y.0,
+            )))
+        });
+        assert!(
+            (max_dist - (hw + STROKE_AA_DILATION)).abs() < 0.05,
+            "vertex span {max_dist} != half_width + dilation = {}",
+            hw + STROKE_AA_DILATION
+        );
         for i in (0..n).step_by(3) {
             let xs: Vec<f32> = path.vertices[i..i + 3]
                 .iter()
@@ -627,10 +662,14 @@ mod tests {
     }
 
     /// Verifies the stroke st encoding: st.y == 0.0 (stroke-mode flag) on
-    /// every vertex, signed |st.x| reaches 1.0 on both side edges, and no
-    /// vertex overshoots the stroke. Fills keep the legacy st == (0, 1).
+    /// every vertex, and — after `STROKE_AA_DILATION` — the dilated edge
+    /// vertices reach `st.x = ±(1 + k/half_width)` while the vertex span is
+    /// `half_width + k` (the analytic width, |st.x| == 1, is still
+    /// 2*half_width). Fills keep the legacy st == (0, 1).
     #[test]
     fn stroke_st_encoding() {
+        let half_width = 1.0; // px(2.0) stroke
+        let edge_st = 1.0 + STROKE_AA_DILATION / half_width; // dilated edge
         let mut builder = PathBuilder::stroke(px(2.0));
         builder.move_to(point(px(0.0), px(0.0)));
         builder.line_to(point(px(10.0), px(0.0)));
@@ -641,24 +680,37 @@ mod tests {
         for v in &path.vertices {
             assert_eq!(v.st_position.y, 0.0);
             assert!(
-                v.st_position.x.abs() <= 1.0 + 1e-3,
-                "stroke vertex overshoots the edge: {:?}",
+                v.st_position.x.abs() <= edge_st + 1e-3,
+                "stroke vertex overshoots the dilated edge: {:?}",
                 v.st_position
             );
             min_abs_st = min_abs_st.min(v.st_position.x.abs());
         }
-        assert!(min_abs_st <= 1.0 + 1e-3);
+        assert!(min_abs_st <= edge_st + 1e-3);
         assert!(
             path.vertices
                 .iter()
-                .any(|v| (v.st_position.x - 1.0).abs() <= 1e-3),
-            "no vertex at st.x ~= +1.0 (right edge)"
+                .any(|v| (v.st_position.x - edge_st).abs() <= 1e-3),
+            "no vertex at st.x ~= +{edge_st} (dilated right edge)"
         );
         assert!(
             path.vertices
                 .iter()
-                .any(|v| (v.st_position.x + 1.0).abs() <= 1e-3),
-            "no vertex at st.x ~= -1.0 (left edge)"
+                .any(|v| (v.st_position.x + edge_st).abs() <= 1e-3),
+            "no vertex at st.x ~= -{edge_st} (dilated left edge)"
+        );
+        // The geometry is dilated: the vertex span (max |y| for this
+        // horizontal stroke) is half_width + STROKE_AA_DILATION, while the
+        // analytic width (|st.x| == 1) is still 2*half_width.
+        let span = path
+            .vertices
+            .iter()
+            .map(|v| v.xy_position.y.0.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            (span - (half_width + STROKE_AA_DILATION)).abs() < 1e-3,
+            "vertex span {span} != half_width + dilation = {}",
+            half_width + STROKE_AA_DILATION
         );
 
         let mut builder = PathBuilder::fill();

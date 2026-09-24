@@ -861,15 +861,13 @@ impl WgpuRenderer {
             });
 
             // `STROKE_ANALYTIC_AA` (see `shaders.wgsl`) is specialized per
-            // pipeline: the analytic stroke coverage is only enabled at one
-            // sample, where there is no geometric antialiasing to compose
-            // with. `path_rasterization` is the only pipeline created with a
-            // sample count above 1, so the value follows `sample_count`;
-            // other entry points never read the constant.
-            let stroke_aa = [(
-                "STROKE_ANALYTIC_AA",
-                if sample_count == 1 { 1.0 } else { 0.0 },
-            )];
+            // pipeline and is now always 1.0: stroke geometry is dilated ~1
+            // logical px at tessellation, so MSAA sample coverage is 1.0
+            // everywhere the analytic ramp is nonzero and the product
+            // (sample coverage x analytic alpha) is exact — including the
+            // multi-sample `path_rasterization` pipeline. Other entry points
+            // never read the constant.
+            let stroke_aa = [("STROKE_ANALYTIC_AA", 1.0)];
             let compilation_options = wgpu::PipelineCompilationOptions {
                 constants: &stroke_aa,
                 ..Default::default()

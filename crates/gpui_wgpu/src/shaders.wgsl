@@ -1049,9 +1049,11 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
 
 // Pipeline-overridable constant, specialized per pipeline (see
 // `WgpuRenderer::create_pipelines`): 1 = analytic per-fragment stroke
-// coverage in `fs_path_rasterization`, 0 = coverage purely from sample
-// geometry (MSAA). Specialized to 0 for any pipeline with more than one
-// sample, where the two would compose multiplicatively.
+// coverage in `fs_path_rasterization`. Always 1.0 now — stroke geometry is
+// dilated ~1 logical px at tessellation so fragments exist across the whole
+// 0.5px AA ramp and MSAA sample coverage is 1.0 wherever the ramp is
+// nonzero, making the product with the analytic alpha exact. The coverage
+// formula below is unchanged.
 override STROKE_ANALYTIC_AA: i32 = 1;
 
 struct PathRasterizationVertex {
