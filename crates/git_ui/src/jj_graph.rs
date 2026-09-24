@@ -37,7 +37,11 @@
 //! Truncated edges (parent outside the emitted window) run to the last row
 //! instead of vanishing, matching `jj log`'s rendering of a cut-off graph.
 
-use std::{collections::HashMap, ops::Range, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    rc::Rc,
+};
 
 use smallvec::SmallVec;
 
@@ -322,6 +326,11 @@ impl JjGraphData {
     }
 
     fn add_entries(&mut self, entries: &[JjLogEntry]) {
+        // Change ids present in the emitted window: parents outside it get
+        // no lane (their edge is elided — jj draws the primary line running
+        // down; allocating merge lanes for unseen parents only sprawls the
+        // graph right, e.g. for `heads(all())`).
+        let emitted: HashSet<&str> = entries.iter().map(|e| e.change_id.as_ref()).collect();
         for entry in entries {
             let commit_row = self.commits.len();
             let commit_id = entry.change_id.to_string();
@@ -381,6 +390,9 @@ impl JjGraphData {
                 .enumerate()
                 .for_each(|(parent_idx, parent)| {
                     let parent = parent.to_string();
+                    if parent_idx > 0 && !emitted.contains(parent.as_str()) {
+                        return;
+                    }
                     if parent_idx == 0 {
                         self.lane_states[commit_lane] = JjLaneState::Active {
                             child: commit_id.clone(),
@@ -794,6 +806,27 @@ mod tests {
         let graph = JjGraphData::from_entries(&entries, 8);
         assert_eq!(lanes(&graph), vec![0, 1, 0]);
         assert_eq!(graph.lines.len(), 2);
+    }
+
+    #[test]
+    fn missing_parents_do_not_sprawl_lanes() {
+        // heads(all()): every node's parents are outside the window. No
+        // merge lanes may be allocated for unseen parents, or the graph
+        // sprawls right; each head's primary edge dangles to the last row.
+        let entries = vec![
+            entry("h1", &["x", "y"]),
+            entry("h2", &["x"]),
+            entry("h3", &["y"]),
+        ];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        assert_eq!(lanes(&graph), vec![0, 1, 2]);
+        assert_eq!(graph.max_lanes, 3);
+        // h1 and h2 dangle to the last row; h3 sits on it (zero-length edge
+        // is skipped).
+        assert_eq!(graph.lines.len(), 2);
+        for line in &graph.lines {
+            assert_eq!(line.full_interval.end, 2);
+        }
     }
 
     #[test]
