@@ -526,7 +526,7 @@ impl JjLog {
             move |_bounds, _window, _cx| {},
             move |bounds: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
                 window.paint_layer(bounds, |window| {
-                    let accent_colors = cx.theme().accents();
+                    let accent_colors = cx.theme().accents().clone();
                     let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
                     let status_colors = NodeStatusColors::from_theme(cx.theme().status());
@@ -542,7 +542,7 @@ impl JjLog {
 
                         let glyph = node_glyph(flags);
                         let color = node_color(glyph, lane_color, &status_colors);
-                        draw_jj_node(glyph, flags, commit_x, row_y_center, color, window);
+                        draw_jj_node(glyph, flags, commit_x, row_y_center, color, window, cx);
                     }
 
                     for line in commit_lines {

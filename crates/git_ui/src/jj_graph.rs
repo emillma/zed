@@ -25,6 +25,9 @@
 //! | `empty`                     | `○`   | lane accent at 40% opacity  |
 //! | default                     | `○`   | lane accent                 |
 //!
+//! `@` and `~` are painted as real text glyphs (jj renders them as
+//! characters in the terminal); `◆`/`×`/`○` are vector shapes.
+//!
 //! (`json()`/`stringify()` strip jj's own color labels, so all styling is
 //! flag-driven — see `jjlog_graph.py`'s coloring note.)
 //!
@@ -36,7 +39,7 @@ use std::{collections::HashMap, ops::Range, rc::Rc};
 use smallvec::SmallVec;
 
 use git::jj::{JjLogEntry, JjLogFlags};
-use gpui::{Pixels, Window, point, px};
+use gpui::{App, Pixels, Window, point, px};
 use theme::StatusColors;
 
 use crate::git_graph::{
@@ -511,10 +514,46 @@ pub(crate) fn node_color(
     }
 }
 
+/// Font size for the text-glyph nodes (`@`, `~`) — sized to read at the
+/// lane scale (the commit dot is 3.5px radius).
+const NODE_GLYPH_FONT_SIZE: Pixels = px(11.0);
+
+/// Paints a single character centered on the node position, as jj's graph
+/// renders `@`/`~` in the terminal: real glyphs from Zed's bundled UI font.
+/// The glyph box is centered via a 1.2em line height (paint_line centers the
+/// ascent+descent box inside it); the constant is tuned visually.
+fn paint_node_glyph(
+    text: &str,
+    center_x: Pixels,
+    center_y: Pixels,
+    color: gpui::Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let run = gpui::TextRun {
+        len: text.len(),
+        font: gpui::font(".ZedSans"),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line = window.text_system().shape_line(
+        text.to_string().into(),
+        NODE_GLYPH_FONT_SIZE,
+        &[run],
+        None,
+    );
+    let line_height = NODE_GLYPH_FONT_SIZE * 1.2;
+    let origin = point(center_x - line.width() / 2.0, center_y - line_height / 2.0);
+    line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx)
+        .ok();
+}
+
 /// Paints one commit node in jj's conventions: `○` normal (solid dot, the
-/// approved v2 base), `◆` immutable (filled diamond), `@` working copy
-/// (larger solid dot), `×` conflict (crossed strokes), `~` hidden (small
-/// dimmed dot). `empty` fades whatever glyph applies to 40% opacity.
+/// approved v2 base), `◆` immutable (filled diamond), `@` working copy and
+/// `~` hidden as real text glyphs, `×` conflict (crossed strokes).
+/// `empty` fades whatever glyph applies to 40% opacity.
 pub(crate) fn draw_jj_node(
     glyph: JjNodeGlyph,
     flags: &JjLogFlags,
@@ -522,6 +561,7 @@ pub(crate) fn draw_jj_node(
     center_y: Pixels,
     color: gpui::Hsla,
     window: &mut Window,
+    cx: &mut App,
 ) {
     let color = if flags.empty { color.alpha(0.4) } else { color };
     let radius = COMMIT_CIRCLE_RADIUS;
@@ -529,18 +569,9 @@ pub(crate) fn draw_jj_node(
     match glyph {
         // Solid dot — the approved v2 base drawing.
         JjNodeGlyph::Normal => draw_commit_circle(center_x, center_y, color, window),
-        // `@`: the anchor node — same dot, slightly larger.
+        // `@`: the working copy, as jj's literal character.
         JjNodeGlyph::WorkingCopy => {
-            let r = radius + px(1.5);
-            let diameter = r * 2.0;
-            let bounds = gpui::Bounds::new(
-                point(center_x - r, center_y - r),
-                gpui::Size {
-                    width: diameter,
-                    height: diameter,
-                },
-            );
-            window.paint_quad(gpui::fill(bounds, color).corner_radii(r));
+            paint_node_glyph("@", center_x, center_y, color, window, cx);
         }
         // `◆`: filled diamond.
         JjNodeGlyph::Immutable => {
@@ -568,18 +599,9 @@ pub(crate) fn draw_jj_node(
                 window.paint_path(path, color);
             }
         }
-        // `~`: small dimmed dot.
+        // `~`: hidden, as jj's elision character.
         JjNodeGlyph::Hidden => {
-            let r = radius * 0.6;
-            let diameter = r * 2.0;
-            let bounds = gpui::Bounds::new(
-                point(center_x - r, center_y - r),
-                gpui::Size {
-                    width: diameter,
-                    height: diameter,
-                },
-            );
-            window.paint_quad(gpui::fill(bounds, color).corner_radii(r));
+            paint_node_glyph("~", center_x, center_y, color, window, cx);
         }
     }
 }

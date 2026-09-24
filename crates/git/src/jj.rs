@@ -220,6 +220,9 @@ impl JjRepository {
     ) -> BoxFuture<'_, Result<Vec<JjLogEntry>>> {
         let jj = self.jj_binary.clone();
         let mut args: Vec<String> = vec!["log".into()];
+        // The panel defaults to jj's own default revset (the `revsets.log`
+        // setting), so repositories control their default view via jj config;
+        // the search bar narrows from there.
         if let Some(revset) = revset {
             args.push("-r".into());
             args.push(revset);
