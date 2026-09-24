@@ -1,12 +1,12 @@
 use crate::git_graph::{
-    COMMIT_CIRCLE_RADIUS, COMMIT_CIRCLE_STROKE_WIDTH, CommitLineSegment, CurveKind, GraphData,
-    LANE_WIDTH, LEFT_PADDING, LINE_WIDTH, accent_colors_count, draw_commit_circle, lane_center_x,
-    timestamp_format, to_row_center,
+    COMMIT_CIRCLE_RADIUS, COMMIT_CIRCLE_STROKE_WIDTH, CommitLineSegment, CurveKind, LANE_WIDTH,
+    LEFT_PADDING, LINE_WIDTH, accent_colors_count, lane_center_x, timestamp_format, to_row_center,
 };
+use crate::jj_graph::{JjGraphData, NodeStatusColors, draw_jj_node, node_color, node_glyph};
 use crate::jj_settings::JjSettings;
 use anyhow::Result;
 use editor::Editor;
-use git::{Oid, jj::JjLogEntry, repository::InitialGraphCommitData};
+use git::jj::JjLogEntry;
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, DefiniteLength, DismissEvent, Entity, EventEmitter,
     FocusHandle, Focusable, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, Render,
@@ -15,8 +15,6 @@ use gpui::{
 use menu::Confirm;
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
 use std::collections::BTreeMap;
-use std::str::FromStr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
@@ -58,7 +56,7 @@ pub struct JjLog {
     focus_handle: FocusHandle,
     git_store: Entity<GitStore>,
     entries: Vec<JjLogEntry>,
-    graph_data: Option<GraphData>,
+    graph_data: Option<JjGraphData>,
     table_interaction_state: Entity<TableInteractionState>,
     // GitGraph's column machinery: user-draggable widths and per-column
     // visibility toggled from the header's right-click context menu.
@@ -216,24 +214,13 @@ impl JjLog {
                 match error {
                     Some(error) => this.error = Some(error),
                     None => {
-                        let commits: Vec<Arc<InitialGraphCommitData>> = entries
-                            .iter()
-                            .filter_map(|entry| {
-                                let sha = Oid::from_str(&entry.commit_id).ok()?;
-                                Some(Arc::new(InitialGraphCommitData {
-                                    sha,
-                                    parents: entry
-                                        .parents
-                                        .iter()
-                                        .filter_map(|parent| Oid::from_str(parent).ok())
-                                        .collect(),
-                                    ref_names: entry.bookmarks.clone(),
-                                }))
-                            })
-                            .collect();
-                        let mut graph_data =
-                            GraphData::new(accent_colors_count(&cx.theme().accents()));
-                        graph_data.add_commits(&commits);
+                        // The lane engine is jj-native: change-id keyed, fed
+                        // straight from the parsed entries — no git types in
+                        // the render path.
+                        let graph_data = JjGraphData::from_entries(
+                            &entries,
+                            accent_colors_count(&cx.theme().accents()),
+                        );
                         this.entries = entries;
                         this.graph_data = Some(graph_data);
                         this.error = None;
@@ -491,7 +478,7 @@ impl JjLog {
     /// solid commit dots.
     fn render_graph_canvas(
         &self,
-        graph_data: &GraphData,
+        graph_data: &JjGraphData,
         row_height: Pixels,
         graph_width: Pixels,
         window: &Window,
@@ -519,6 +506,12 @@ impl JjLog {
         let viewport_range = first_visible_row.min(commit_count.saturating_sub(1))
             ..last_visible_row.min(commit_count);
         let rows = graph_data.commits[viewport_range.clone()].to_vec();
+        // Flags for the visible rows, aligned with `rows` — the glyph and
+        // color mapping reads them at paint time.
+        let visible_flags: Vec<git::jj::JjLogFlags> = self.entries[viewport_range.clone()]
+            .iter()
+            .map(|entry| entry.flags.clone())
+            .collect();
         let commit_lines: Vec<_> = graph_data
             .lines
             .iter()
@@ -536,15 +529,20 @@ impl JjLog {
                     let accent_colors = cx.theme().accents();
                     let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
-                    for (row_idx, row) in rows.into_iter().enumerate() {
-                        let row_color = accent_colors.color_for_index(row.color_idx as u32);
+                    let status_colors = NodeStatusColors::from_theme(cx.theme().status());
+                    for (row_idx, (row, flags)) in
+                        rows.into_iter().zip(visible_flags.iter()).enumerate()
+                    {
+                        let lane_color = accent_colors.color_for_index(row.color_idx as u32);
                         let row_y_center =
                             bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
                                 - vertical_scroll_offset;
 
                         let commit_x = lane_center_x(bounds, row.lane as f32);
 
-                        draw_commit_circle(commit_x, row_y_center, row_color, window);
+                        let glyph = node_glyph(flags);
+                        let color = node_color(glyph, lane_color, &status_colors);
+                        draw_jj_node(glyph, flags, commit_x, row_y_center, color, window);
                     }
 
                     for line in commit_lines {
@@ -803,15 +801,9 @@ impl Render for JjLog {
             };
 
             let row_height = Self::row_height(window, cx);
-            // `GraphData::max_lanes` is private, so derive the same value from
-            // the commit lanes; GitGraph floors the graph at 6 lanes wide.
-            let lane_count = graph_data
-                .commits
-                .iter()
-                .map(|commit| commit.lane + 1)
-                .max()
-                .unwrap_or(6)
-                .max(6);
+            // The engine reports its widest lane layout; GitGraph floors the
+            // graph at 6 lanes wide.
+            let lane_count = graph_data.max_lanes.max(6);
             let graph_width = LANE_WIDTH * lane_count as f32 + LEFT_PADDING * 2.0;
             // Per-commit lane colors for the bookmark chips; cloned so the row
             // closure can own them (it cannot borrow `self`).

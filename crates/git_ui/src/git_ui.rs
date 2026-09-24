@@ -46,6 +46,7 @@ pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
+pub mod jj_graph;
 pub mod jj_log;
 pub mod jj_settings;
 mod jj_status;
