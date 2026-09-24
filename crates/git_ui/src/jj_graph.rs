@@ -34,8 +34,10 @@
 //! (`json()`/`stringify()` strip jj's own color labels, so all styling is
 //! flag-driven — see `jjlog_graph.py`'s coloring note.)
 //!
-//! Truncated edges (parent outside the emitted window) run to the last row
-//! instead of vanishing, matching `jj log`'s rendering of a cut-off graph.
+//! A parent outside the emitted window has its edge land on a synthesized
+//! elided row (`flags.elided`, jj's `(elided revisions)` row the data layer
+//! inserts after the child) instead of dangling; `finish()` is only a
+//! fallback for a window that is missing that row.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -74,6 +76,34 @@ pub(crate) struct JjCommitLine {
     pub(crate) full_interval: Range<usize>,
     pub(crate) color_idx: usize,
     pub(crate) segments: SmallVec<[CommitLineSegment; 1]>,
+}
+
+/// Geometry of one child→parent edge for the 3-part edge renderer:
+/// top stub (child's row, `child_col`→`column`), vertical (in `column`),
+/// bottom stub (parent's row, `column`→`parent_col`).
+///
+/// Consumed by the Phase B renderer (and the tests); nothing reads the
+/// fields in the non-test build yet, hence the allow.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct EdgeLayout {
+    #[cfg(test)]
+    pub(crate) child: String,
+    #[cfg(test)]
+    pub(crate) parent: String,
+    /// Row of the child commit's node — the edge starts here.
+    pub(crate) child_row: usize,
+    /// Row of the parent commit's node — the edge ends here.
+    pub(crate) parent_row: usize,
+    /// The column the vertical segment runs in.
+    pub(crate) column: usize,
+    /// The child node's column.
+    pub(crate) child_col: usize,
+    /// The parent node's column.
+    pub(crate) parent_col: usize,
+    /// The lane's color index: an edge inherits its lane's color, same
+    /// semantics as its sibling `JjCommitLine`.
+    pub(crate) color_idx: usize,
 }
 
 impl JjCommitLine {
@@ -285,6 +315,16 @@ pub(crate) struct JjGraphData {
     accent_colors_count: usize,
     pub(crate) commits: Vec<Rc<JjCommitRow>>,
     pub(crate) lines: Vec<Rc<JjCommitLine>>,
+    /// Per-edge geometry for the 3-part edge renderer (see [`EdgeLayout`]).
+    /// Edges to parents outside the emitted window land on the elided row
+    /// after their child (`parent_col` = the edge's own column, so the
+    /// bottom stub is zero-length); a window missing that row leaves a line
+    /// in `lines` without an `EdgeLayout` (the `finish()` fallback).
+    pub(crate) edges: Vec<EdgeLayout>,
+    /// Lanes of edges whose parent is outside the emitted window, waiting
+    /// for the elided row the data layer inserts after their child; an
+    /// elided row resolves them all at its own row index.
+    elided_landings: SmallVec<[usize; 2]>,
     /// The widest the lane area ever got while laying out the window.
     pub(crate) max_lanes: usize,
 }
@@ -295,10 +335,12 @@ impl JjGraphData {
             lane_states: SmallVec::default(),
             lane_colors: HashMap::default(),
             parent_to_lanes: HashMap::default(),
+            elided_landings: SmallVec::default(),
             next_color: 0,
             accent_colors_count,
             commits: Vec::with_capacity(entries.len()),
             lines: Vec::with_capacity(entries.len() / 2),
+            edges: Vec::with_capacity(entries.len()),
             max_lanes: 0,
         };
         graph.add_entries(entries);
@@ -327,26 +369,92 @@ impl JjGraphData {
 
     fn add_entries(&mut self, entries: &[JjLogEntry]) {
         // Change ids present in the emitted window: parents outside it get
-        // no lane (their edge is elided — jj draws the primary line running
-        // down; allocating merge lanes for unseen parents only sprawls the
-        // graph right, e.g. for `heads(all())`).
+        // no merge lane (allocating lanes for unseen parents only sprawls
+        // the graph right, e.g. for `heads(all())`); the primary edge to
+        // such a parent lands on the elided row the data layer inserts
+        // after its child.
         let emitted: HashSet<&str> = entries.iter().map(|e| e.change_id.as_ref()).collect();
         for entry in entries {
             let commit_row = self.commits.len();
             let commit_id = entry.change_id.to_string();
+
+            // An elided row lands the edges pending from above: lanes whose
+            // parent is outside the window terminate here, with a
+            // zero-length bottom stub (`parent_col` = the edge's own
+            // column, so the vertical runs straight into the `~`), and the
+            // row takes the last such lane for its glyph.
+            let mut landing_lane: Option<usize> = None;
+            if entry.flags.elided {
+                let landings = std::mem::take(&mut self.elided_landings);
+                for lane in landings {
+                    landing_lane = Some(lane);
+                    let color = self.lane_colors.get(&lane).copied().unwrap_or(0);
+                    let state = &mut self.lane_states[lane];
+                    let edge_source = match state {
+                        JjLaneState::Active {
+                            child,
+                            parent,
+                            starting_row,
+                            starting_col,
+                            ..
+                        } => {
+                            Some((child.clone(), parent.clone(), *starting_row, *starting_col))
+                        }
+                        JjLaneState::Empty => None,
+                    };
+                    if let Some(commit_line) = state.to_commit_lines(commit_row, lane, lane, color) {
+                        let color_idx = commit_line.color_idx;
+                        self.lines.push(Rc::new(commit_line));
+                        #[cfg_attr(not(test), allow(unused_variables))]
+                        if let Some((child, parent, child_row, child_col)) = edge_source {
+                            self.edges.push(EdgeLayout {
+                                #[cfg(test)]
+                                child,
+                                #[cfg(test)]
+                                parent,
+                                child_row,
+                                parent_row: commit_row,
+                                column: lane,
+                                child_col,
+                                parent_col: lane,
+                                color_idx,
+                            });
+                        }
+                    }
+                }
+            }
 
             let commit_lane = self
                 .parent_to_lanes
                 .get(&commit_id)
                 .and_then(|lanes| lanes.iter().min().copied());
 
-            let commit_lane = commit_lane.unwrap_or_else(|| self.first_empty_lane_idx());
+            let commit_lane = commit_lane
+                // An elided row with no incoming edge sits in the column
+                // where its edge lands (the `~` is the edge's terminus).
+                .or(landing_lane.filter(|_| entry.flags.elided))
+                .unwrap_or_else(|| self.first_empty_lane_idx());
 
             let commit_color = self.get_lane_color(commit_lane);
 
             if let Some(lanes) = self.parent_to_lanes.remove(&commit_id) {
                 for lane_column in lanes {
                     let state = &mut self.lane_states[lane_column];
+
+                    // Edge geometry, captured while the state is still Active:
+                    // `to_commit_lines` consumes it. `child`/`starting_col` are
+                    // where the edge starts, `lane_column` where its vertical
+                    // runs, `commit_lane` where the parent node sits.
+                    let edge_source = match state {
+                        JjLaneState::Active {
+                            child,
+                            parent,
+                            starting_row,
+                            starting_col,
+                            ..
+                        } => Some((child.clone(), parent.clone(), *starting_row, *starting_col)),
+                        JjLaneState::Empty => None,
+                    };
 
                     if let JjLaneState::Active {
                         starting_row,
@@ -379,60 +487,89 @@ impl JjGraphData {
                     if let Some(commit_line) =
                         state.to_commit_lines(commit_row, lane_column, commit_lane, commit_color)
                     {
+                        let color_idx = commit_line.color_idx;
                         self.lines.push(Rc::new(commit_line));
+
+                        #[cfg_attr(not(test), allow(unused_variables))]
+                        if let Some((child, parent, child_row, child_col)) = edge_source {
+                            self.edges.push(EdgeLayout {
+                                #[cfg(test)]
+                                child,
+                                #[cfg(test)]
+                                parent,
+                                child_row,
+                                parent_row: commit_row,
+                                column: lane_column,
+                                child_col,
+                                parent_col: commit_lane,
+                                color_idx,
+                            });
+                        }
                     }
                 }
             }
 
-            entry
-                .parent_change_ids
-                .iter()
-                .enumerate()
-                .for_each(|(parent_idx, parent)| {
-                    let parent = parent.to_string();
-                    if parent_idx > 0 && !emitted.contains(parent.as_str()) {
-                        return;
-                    }
-                    if parent_idx == 0 {
-                        self.lane_states[commit_lane] = JjLaneState::Active {
-                            child: commit_id.clone(),
-                            parent: parent.clone(),
-                            color: Some(commit_color),
-                            starting_col: commit_lane,
-                            starting_row: commit_row,
-                            destination_column: None,
-                            segments: smallvec::smallvec![CommitLineSegment::Straight {
-                                to_row: usize::MAX
-                            }],
-                        };
+            // Elided rows have no outgoing edges: they exist to be landed
+            // on, never to point at a parent themselves.
+            if !entry.flags.elided {
+                entry
+                    .parent_change_ids
+                    .iter()
+                    .enumerate()
+                    .for_each(|(parent_idx, parent)| {
+                        let parent = parent.to_string();
+                        if parent_idx > 0 && !emitted.contains(parent.as_str()) {
+                            return;
+                        }
+                        if parent_idx == 0 {
+                            self.lane_states[commit_lane] = JjLaneState::Active {
+                                child: commit_id.clone(),
+                                parent: parent.clone(),
+                                color: Some(commit_color),
+                                starting_col: commit_lane,
+                                starting_row: commit_row,
+                                destination_column: None,
+                                segments: smallvec::smallvec![CommitLineSegment::Straight {
+                                    to_row: usize::MAX
+                                }],
+                            };
 
-                        self.parent_to_lanes
-                            .entry(parent)
-                            .or_default()
-                            .push(commit_lane);
-                    } else {
-                        let new_lane = self.first_empty_lane_idx();
+                            if emitted.contains(parent.as_str()) {
+                                self.parent_to_lanes
+                                    .entry(parent)
+                                    .or_default()
+                                    .push(commit_lane);
+                            } else {
+                                // The parent never appears in the window:
+                                // the data layer inserts an elided row
+                                // after this one, and the edge lands there
+                                // (or in `finish()` if it does not).
+                                self.elided_landings.push(commit_lane);
+                            }
+                        } else {
+                            let new_lane = self.first_empty_lane_idx();
 
-                        self.lane_states[new_lane] = JjLaneState::Active {
-                            child: commit_id.clone(),
-                            parent: parent.clone(),
-                            color: None,
-                            starting_col: commit_lane,
-                            starting_row: commit_row,
-                            destination_column: None,
-                            segments: smallvec::smallvec![CommitLineSegment::Curve {
-                                to_column: usize::MAX,
-                                on_row: usize::MAX,
-                                curve_kind: CurveKind::Merge,
-                            }],
-                        };
+                            self.lane_states[new_lane] = JjLaneState::Active {
+                                child: commit_id.clone(),
+                                parent: parent.clone(),
+                                color: None,
+                                starting_col: commit_lane,
+                                starting_row: commit_row,
+                                destination_column: None,
+                                segments: smallvec::smallvec![CommitLineSegment::Curve {
+                                    to_column: usize::MAX,
+                                    on_row: usize::MAX,
+                                    curve_kind: CurveKind::Merge,
+                                }],
+                            };
 
-                        self.parent_to_lanes
-                            .entry(parent)
-                            .or_default()
-                            .push(new_lane);
-                    }
-                });
+                            self.parent_to_lanes
+                                .entry(parent)
+                                .or_default()
+                                .push(new_lane);
+                        }
+                    });
+            }
 
             self.max_lanes = self.max_lanes.max(self.lane_states.len());
 
@@ -443,25 +580,55 @@ impl JjGraphData {
         }
     }
 
-    /// Terminates lanes whose parent never appeared in the emitted window:
-    /// `jj log` draws such cut-off edges running to the bottom of the graph
-    /// instead of dropping them.
+    /// Fallback for a window that is missing an elided row: a dangling edge
+    /// whose landing row never came terminates at the last row instead of
+    /// vanishing. Unreachable for well-formed input — every dangling
+    /// primary edge is registered with the row below its child, which the
+    /// data layer guarantees to be the elided row (or an in-window parent
+    /// that resolves the lane before `finish` runs), and an elided row —
+    /// the only row that may follow a dangling one — resolves its own.
     fn finish(&mut self) {
         let Some(last_row) = self.commits.len().checked_sub(1) else {
             return;
         };
-        let lane_colors = self.lane_colors.clone();
-        for (lane_column, state) in self.lane_states.iter_mut().enumerate() {
-            let starting_row = match state {
-                JjLaneState::Active { starting_row, .. } => *starting_row,
+        for lane in self.elided_landings.drain(..) {
+            let color = self.lane_colors.get(&lane).copied().unwrap_or(0);
+            let state = &mut self.lane_states[lane];
+            let (starting_row, edge_source) = match state {
+                JjLaneState::Active {
+                    child,
+                    parent,
+                    starting_row,
+                    starting_col,
+                    ..
+                } => (
+                    *starting_row,
+                    Some((child.clone(), parent.clone(), *starting_row, *starting_col)),
+                ),
                 JjLaneState::Empty => continue,
             };
+            // The child already sits on the last row: a zero-length edge.
             if starting_row >= last_row {
                 continue;
             }
-            let color = lane_colors.get(&lane_column).copied().unwrap_or(0);
-            if let Some(line) = state.to_commit_lines(last_row, lane_column, lane_column, color) {
-                self.lines.push(Rc::new(line));
+            if let Some(commit_line) = state.to_commit_lines(last_row, lane, lane, color) {
+                let color_idx = commit_line.color_idx;
+                self.lines.push(Rc::new(commit_line));
+                #[cfg_attr(not(test), allow(unused_variables))]
+                if let Some((child, parent, child_row, child_col)) = edge_source {
+                    self.edges.push(EdgeLayout {
+                        #[cfg(test)]
+                        child,
+                        #[cfg(test)]
+                        parent,
+                        child_row,
+                        parent_row: last_row,
+                        column: lane,
+                        child_col,
+                        parent_col: lane,
+                        color_idx,
+                    });
+                }
             }
         }
     }
@@ -698,7 +865,16 @@ mod tests {
             mine: false,
             ancestor_of_wc: false,
             descendant_of_wc: false,
+            elided: false,
         }
+    }
+
+    /// A synthesized `(elided revisions)` row (the data layer builds these
+    /// in `jj_log`, Phase C2; the layout just consumes them).
+    fn elided_row(change_id: &str) -> JjLogEntry {
+        let mut entry = entry(change_id, &[]);
+        entry.flags.elided = true;
+        entry
     }
 
     fn entry(change_id: &str, parents: &[&str]) -> JjLogEntry {
@@ -725,6 +901,18 @@ mod tests {
 
     fn lanes(graph: &JjGraphData) -> Vec<usize> {
         graph.commits.iter().map(|row| row.lane).collect()
+    }
+
+    fn edge<'g>(graph: &'g JjGraphData, child: &str, parent: &str) -> &'g EdgeLayout {
+        graph
+            .edges
+            .iter()
+            .find(|e| e.child == child && e.parent == parent)
+            .unwrap_or_else(|| panic!("no edge {child} → {parent}"))
+    }
+
+    fn full<'g>(e: &'g EdgeLayout) -> (usize, usize, usize, usize, usize, usize) {
+        (e.child_row, e.parent_row, e.column, e.child_col, e.parent_col, e.color_idx)
     }
 
     #[test]
@@ -830,10 +1018,190 @@ mod tests {
     }
 
     #[test]
+    fn freed_lanes_reused_at_leftmost_free() {
+        // c1→p and c2→p both free at p's row; p reuses the freed lane 0 for
+        // its own edge, and x (no incoming) takes the leftmost free lane —
+        // the freed lane 1, not a fresh lane 2.
+        let entries = vec![
+            entry("c1", &["p"]),
+            entry("c2", &["p"]),
+            entry("p", &["a"]),
+            entry("x", &["a"]),
+            entry("a", &[]),
+        ];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        assert_eq!(lanes(&graph), vec![0, 1, 0, 1, 0]);
+        assert_eq!(graph.edges.len(), graph.lines.len());
+        assert_eq!(full(edge(&graph, "c1", "p")), (0, 2, 0, 0, 0, 0));
+        assert_eq!(full(edge(&graph, "c2", "p")), (1, 2, 1, 1, 0, 1));
+        assert_eq!(full(edge(&graph, "p", "a")), (2, 4, 0, 0, 0, 0));
+        assert_eq!(
+            full(edge(&graph, "x", "a")),
+            (3, 4, 1, 1, 0, 1),
+            "x reuses freed lane 1"
+        );
+    }
+
+    #[test]
+    fn free_happens_on_last_use_only() {
+        // x is processed while c2→p is still pending: lane 1 must not be
+        // taken (one of the two pending uses of p is unresolved), so x goes
+        // to a fresh lane 2. Both lanes free together when p is reached.
+        let entries = vec![
+            entry("c1", &["p"]),
+            entry("c2", &["p"]),
+            entry("x", &["a"]),
+            entry("p", &["a"]),
+            entry("a", &[]),
+        ];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        assert_eq!(lanes(&graph), vec![0, 1, 2, 0, 0]);
+        assert_eq!(
+            edge(&graph, "x", "a").column,
+            2,
+            "lane 1 stays reserved until p's row"
+        );
+        assert_eq!(full(edge(&graph, "c1", "p")), (0, 3, 0, 0, 0, 0));
+        assert_eq!(full(edge(&graph, "c2", "p")), (1, 3, 1, 1, 0, 1));
+        assert_eq!(full(edge(&graph, "x", "a")), (2, 4, 2, 2, 0, 2));
+        assert_eq!(full(edge(&graph, "p", "a")), (3, 4, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn three_parent_octopus_allocates_leftmost_free_per_extra_parent() {
+        let entries = vec![
+            entry("m", &["p1", "p2", "p3"]),
+            entry("p3", &["a"]),
+            entry("p2", &["a"]),
+            entry("p1", &["a"]),
+            entry("a", &[]),
+        ];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        // The octopus sits in its first parent's column (0); the extra
+        // parents' edges take leftmost-free lanes 1 and 2 in parent order.
+        assert_eq!(lanes(&graph), vec![0, 2, 1, 0, 0]);
+        assert_eq!(graph.edges.len(), graph.lines.len());
+        assert_eq!(full(edge(&graph, "m", "p1")), (0, 3, 0, 0, 0, 0));
+        assert_eq!(full(edge(&graph, "m", "p2")), (0, 2, 1, 0, 1, 2));
+        assert_eq!(full(edge(&graph, "m", "p3")), (0, 1, 2, 0, 2, 1));
+        assert_eq!(full(edge(&graph, "p3", "a")), (1, 4, 2, 2, 0, 1));
+        assert_eq!(full(edge(&graph, "p2", "a")), (2, 4, 1, 1, 0, 2));
+        assert_eq!(full(edge(&graph, "p1", "a")), (3, 4, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn four_parent_merge_allocates_three_leftmost_free_lanes() {
+        let entries = vec![
+            entry("m", &["p1", "p2", "p3", "p4"]),
+            entry("p4", &["a"]),
+            entry("p3", &["a"]),
+            entry("p2", &["a"]),
+            entry("p1", &["a"]),
+            entry("a", &[]),
+        ];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        assert_eq!(lanes(&graph), vec![0, 3, 2, 1, 0, 0]);
+        assert_eq!(graph.max_lanes, 4);
+        assert_eq!(graph.edges.len(), graph.lines.len());
+        assert_eq!(full(edge(&graph, "m", "p1")), (0, 4, 0, 0, 0, 0));
+        assert_eq!(full(edge(&graph, "m", "p2")), (0, 3, 1, 0, 1, 3));
+        assert_eq!(full(edge(&graph, "m", "p3")), (0, 2, 2, 0, 2, 2));
+        assert_eq!(full(edge(&graph, "m", "p4")), (0, 1, 3, 0, 3, 1));
+        assert_eq!(full(edge(&graph, "p4", "a")), (1, 5, 3, 3, 0, 1));
+        assert_eq!(full(edge(&graph, "p3", "a")), (2, 5, 2, 2, 0, 2));
+        assert_eq!(full(edge(&graph, "p2", "a")), (3, 5, 1, 1, 0, 3));
+        assert_eq!(full(edge(&graph, "p1", "a")), (4, 5, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn working_copy_and_root_stay_in_column_zero() {
+        // @ is the newest row and the root the oldest: the mainline keeps
+        // lane 0 from @ through to the root, so both sit in column 0.
+        let mut wc = entry("w", &["m"]);
+        wc.flags.working_copy = true;
+        let entries = vec![wc, entry("b", &["m"]), entry("m", &["a"]), entry("a", &[])];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        assert_eq!(lanes(&graph), vec![0, 1, 0, 0]);
+        assert_eq!(graph.commits[0].lane, 0, "working copy in column 0");
+        assert_eq!(
+            graph.commits.last().unwrap().lane,
+            0,
+            "root in column 0"
+        );
+        assert_eq!(full(edge(&graph, "w", "m")), (0, 2, 0, 0, 0, 0));
+        assert_eq!(full(edge(&graph, "b", "m")), (1, 2, 1, 1, 0, 1));
+        assert_eq!(full(edge(&graph, "m", "a")), (2, 3, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn elided_rows_land_dangling_edges() {
+        // The C1 fixture: @ merges two branches, each of whose next row has
+        // its parent outside the window. The elided rows are hand-built (the
+        // synthesis itself lands in `jj_log` in C2): the data layer inserts
+        // one directly after each row whose parent is missing.
+        let mut at = entry("kozmttlk", &["rzvnrvrz", "xpzmvpqp"]);
+        at.flags.working_copy = true;
+        let entries = vec![
+            at,
+            entry("xpzmvpqp", &["uktnvvqq"]),
+            elided_row("el-xp"),
+            entry("rzvnrvrz", &["rz-out"]),
+            elided_row("el-rz"),
+            entry("root", &[]),
+        ];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        assert_eq!(graph.commits.len(), 6, "elided rows consume row indices");
+        // Lanes: @ and the mainline in 0, xpzmvpqp in its merge lane 1, each
+        // elided row in the column of the edge that lands on it, and the
+        // root reusing the freed lane 0 — nothing sprawls a fresh lane.
+        assert_eq!(lanes(&graph), vec![0, 1, 1, 0, 0, 0]);
+        assert_eq!(graph.max_lanes, 2);
+        // Every edge lands on a row: no line is left dangling in `lines`.
+        assert_eq!(graph.edges.len(), 4);
+        assert_eq!(graph.lines.len(), graph.edges.len());
+        // @→rzvnrvrz runs down lane 0, passing the elided row at row 2.
+        assert_eq!(full(edge(&graph, "kozmttlk", "rzvnrvrz")), (0, 3, 0, 0, 0, 0));
+        // @→xpzmvpqp is the merge curve into lane 1.
+        assert_eq!(full(edge(&graph, "kozmttlk", "xpzmvpqp")), (0, 1, 1, 0, 1, 1));
+        // xpzmvpqp's outside parent lands on the elided row: zero-length
+        // bottom stub (parent_col == column), straight into the `~`.
+        assert_eq!(full(edge(&graph, "xpzmvpqp", "uktnvvqq")), (1, 2, 1, 1, 1, 1));
+        // rzvnrvrz's outside parent lands on its elided row.
+        assert_eq!(full(edge(&graph, "rzvnrvrz", "rz-out")), (3, 4, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn elided_row_lands_merge_primary_edge() {
+        // An octopus merge whose primary parent is outside the window: the
+        // elided row lands it in the mainline lane, and the in-window
+        // parents take their merge lanes as usual.
+        let entries = vec![
+            entry("m", &["oout", "p2", "p3"]),
+            elided_row("el-m"),
+            entry("p3", &["a"]),
+            entry("p2", &["a"]),
+            entry("a", &[]),
+        ];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        assert_eq!(graph.commits.len(), 5);
+        assert_eq!(lanes(&graph), vec![0, 0, 2, 1, 1]);
+        // An edge's color is its own column's lane color (lanes colored in
+        // first-use order: 0 before 2 before 1); it lands in the parent's
+        // lane, so `a` in lane 1 makes both bottom edges bend into column 1.
+        assert_eq!(full(edge(&graph, "m", "oout")), (0, 1, 0, 0, 0, 0));
+        assert_eq!(full(edge(&graph, "m", "p2")), (0, 3, 1, 0, 1, 2));
+        assert_eq!(full(edge(&graph, "m", "p3")), (0, 2, 2, 0, 2, 1));
+        assert_eq!(full(edge(&graph, "p3", "a")), (2, 4, 2, 2, 1, 1));
+        assert_eq!(full(edge(&graph, "p2", "a")), (3, 4, 1, 1, 1, 2));
+        assert_eq!(graph.lines.len(), graph.edges.len());
+    }
+
+    #[test]
     fn empty_window_produces_nothing() {
         let graph = JjGraphData::from_entries(&[], 8);
         assert!(graph.commits.is_empty());
         assert!(graph.lines.is_empty());
+        assert!(graph.edges.is_empty());
         assert_eq!(graph.max_lanes, 0);
     }
 

@@ -286,6 +286,10 @@ pub struct JjLogFlags {
     pub ancestor_of_wc: bool,
     /// A descendant of the working copy.
     pub descendant_of_wc: bool,
+    /// A synthesized `(elided revisions)` row: the data layer inserts it
+    /// directly after a revision whose parent is outside the emitted window
+    /// so the graph's dangling edge has a row to land on (see `jj_graph`).
+    pub elided: bool,
 }
 
 /// A single `jj log` revision, for the history panel.
@@ -600,6 +604,10 @@ struct LogLineFlags {
     ancestor_of_wc: bool,
     #[serde(default)]
     descendant_of_wc: bool,
+    /// Never emitted by the CLI template (it cannot name an elided row);
+    /// `serde(default)` keeps the JSONL parsing intact.
+    #[serde(default)]
+    elided: bool,
 }
 
 /// One `jj log` JSONL line (see `LOG_TEMPLATE`).
@@ -648,6 +656,7 @@ fn log_line_to_entry(line: LogLine) -> JjLogEntry {
             mine: flags.mine,
             ancestor_of_wc: flags.ancestor_of_wc,
             descendant_of_wc: flags.descendant_of_wc,
+            elided: flags.elided,
         },
         is_merge: commit.parents.len() > 1,
         is_head: false,
@@ -1221,6 +1230,20 @@ mod tests {
     #[test]
     fn test_parse_log_output_empty() {
         assert!(parse_log_output("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_log_output_elided_flag() {
+        // The CLI template never emits `elided`: it defaults to false, and
+        // a synthesized row (built by the data layer, not parsed) sets it.
+        let entries = parse_log_output(LOG_LINE_LINEAR);
+        assert!(!entries[0].flags.elided, "elided defaults to false");
+        let elided_line = LOG_LINE_LINEAR.replace(
+            "\"descendant_of_wc\":false",
+            "\"descendant_of_wc\":false,\"elided\":true",
+        );
+        let entries = parse_log_output(&elided_line);
+        assert!(entries[0].flags.elided);
     }
 
     #[test]

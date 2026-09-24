@@ -1,23 +1,22 @@
 use crate::git_graph::{
-    CommitLineSegment, CurveKind, LANE_WIDTH, LEFT_PADDING, LINE_WIDTH, accent_colors_count,
-    lane_center_x, timestamp_format, to_row_center,
+    LANE_WIDTH, LEFT_PADDING, LINE_WIDTH, accent_colors_count, lane_center_x, timestamp_format,
 };
 use crate::jj_graph::{
-    JJ_GLYPH_CLEARANCE, JJ_NODE_RADIUS, JJ_NODE_STROKE_WIDTH, JjGraphData, JjNodeGlyph,
-    NodeStatusColors, draw_jj_node, node_color, node_glyph,
+    JJ_GLYPH_CLEARANCE, JJ_NODE_RADIUS, JjGraphData, JjNodeGlyph, NodeStatusColors, draw_jj_node,
+    node_color, node_glyph,
 };
 use crate::jj_settings::JjSettings;
 use anyhow::Result;
 use editor::Editor;
-use git::jj::JjLogEntry;
+use git::jj::{JjLogEntry, JjLogFlags};
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, DefiniteLength, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, Render,
+    FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, Render,
     SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, point, px,
 };
 use menu::Confirm;
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
@@ -28,7 +27,7 @@ use ui::{
     render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
 };
 use workspace::{
-    ModalView, SerializableItem, Workspace,
+    SerializableItem, Workspace,
     item::{Item, ItemEvent},
 };
 
@@ -50,6 +49,99 @@ const DESCRIPTION_COLUMN_FRACTION: f32 = 0.6192;
 const DATE_COLUMN_FRACTION: f32 = 0.1032;
 const AUTHOR_COLUMN_FRACTION: f32 = 0.086;
 const COMMIT_COLUMN_FRACTION: f32 = 0.0516;
+
+/// Extra width (logical px) added PER SIDE to each lane stroke: every
+/// commit line is stroked twice with identical geometry — a
+/// background-colored border `LINE_WIDTH + 2 * EDGE_BORDER_WIDTH` wide
+/// under the lane-colored fill — so a later line's border cuts through
+/// an earlier line's fill at crossings while a line's own bends (same
+/// path) never self-cut.
+const EDGE_BORDER_WIDTH: Pixels = px(1.0);
+
+/// Clearance from a node center to where an edge stub attaches or ends: just
+/// outside the glyph (radius) plus the lane's background border, so a stub
+/// (and its border) never cuts a node glyph.
+///
+/// `JJ_NODE_RADIUS + EDGE_BORDER_WIDTH` (5.5px), written out because
+/// `Pixels`' derived `Add` is not `const`.
+const JJ_EDGE_CLEARANCE: Pixels = px(5.5);
+/// y-offset of the child-row stub from the child node center.
+const B_STUB_OFFSET: Pixels = JJ_EDGE_CLEARANCE;
+/// y-offset of the parent-row stub from the parent node center.
+const T_STUB_OFFSET: Pixels = JJ_EDGE_CLEARANCE;
+/// Edges whose vertical column reaches this far right are elided (the graph
+/// is too wide to draw them); their nodes still render.
+const MAX_EDGE_COLUMN: usize = 64;
+/// Z-layers, in paint order: verticals first, then stubs.
+const LAYER_V: u8 = 0;
+const LAYER_BT: u8 = 1;
+
+/// One commit line built twice with identical geometry: the wider
+/// background-colored `border` stroke under the narrower lane-colored
+/// `fill`. Every geometry op is forwarded to both builders so the two
+/// paths stay in lockstep.
+struct LaneEdge {
+    border: PathBuilder,
+    fill: PathBuilder,
+}
+
+impl LaneEdge {
+    fn new() -> Self {
+        Self {
+            border: PathBuilder::stroke(LINE_WIDTH + 2.0 * EDGE_BORDER_WIDTH),
+            fill: PathBuilder::stroke(LINE_WIDTH),
+        }
+    }
+
+    fn move_to(&mut self, to: Point<Pixels>) {
+        self.border.move_to(to);
+        self.fill.move_to(to);
+    }
+
+    fn line_to(&mut self, to: Point<Pixels>) {
+        self.border.line_to(to);
+        self.fill.line_to(to);
+    }
+
+}
+
+/// The color painted behind the lanes — must match what actually renders
+/// there. JjLog is a workspace tab item that paints no background of its
+/// own (GitGraph, in contrast, paints `editor_background` on its root
+/// div), so the workspace's `background` shows through behind the graph.
+fn lane_border_color(cx: &App) -> Hsla {
+    cx.theme().colors().background
+}
+
+/// One paintable edge fragment: a z-layer (verticals paint before stubs), a
+/// sort key (column for verticals, reach for stubs - longer first, so the
+/// shorter end up in front), the dual border/fill path, and its accent index.
+struct EdgePart {
+    layer: u8,
+    sort_key: usize,
+    lane: LaneEdge,
+    color_idx: usize,
+}
+
+/// Numeric geometry of one edge, extracted so the `'static` canvas closure can
+/// own it instead of borrowing the graph (whose `EdgeLayout`s carry test-only
+/// `String`s and aren't `Clone`).
+struct EdgeGeom {
+    child_row: usize,
+    parent_row: usize,
+    column: usize,
+    child_col: usize,
+    parent_col: usize,
+    color_idx: usize,
+}
+
+impl EdgeGeom {
+    /// The widest column this edge touches — the stubs' z-order key
+    /// (longer reach sorts first, so shorter stubs end up in front).
+    fn reach(&self) -> usize {
+        self.column.max(self.child_col).max(self.parent_col)
+    }
+}
 
 /// The jj history panel: a list of the first 200 changes of the first
 /// jj repository in the project, if any. Rendered like GitGraph: a
@@ -220,6 +312,13 @@ impl JjLog {
                         // The lane engine is jj-native: change-id keyed, fed
                         // straight from the parsed entries — no git types in
                         // the render path.
+                        // A parent outside the emitted window has no row of
+                        // its own: synthesize the `(elided revisions)` row
+                        // after each entry that dangles, so the graph's
+                        // dangling edge lands on a real row (and the table
+                        // shows the cut-off) instead of running to the
+                        // window's end.
+                        let entries = synthesize_elided_entries(entries);
                         let graph_data = JjGraphData::from_entries(
                             &entries,
                             accent_colors_count(&cx.theme().accents()),
@@ -476,9 +575,9 @@ impl JjLog {
 
     /// Paints the lane graph over the table's visible rows, synced to the
     /// table's scroll state exactly like GitGraph: rows and lanes are shifted
-    /// by the table's scroll offset and only the visible range is painted.
-    /// Uses GitGraph's Straight/Curve segments, per-lane accent colors and
-    /// solid commit dots.
+    /// table's scroll offset and only the visible range is painted.
+    /// Every edge is drawn from `jj_graph`'s `EdgeLayout` as up to three
+    /// fragments (bottom stub, vertical, top stub), z-ordered by layer.
     fn render_graph_canvas(
         &self,
         graph_data: &JjGraphData,
@@ -517,31 +616,60 @@ impl JjLog {
             .collect();
         // Per-row vertical clearance where lane lines start/end (absolute-row
         // indexed): text glyphs (`@`, `~`) need more room than the circles so
-        // the lines don't cross them.
+        // the lines don't cross them, plus `EDGE_BORDER_WIDTH` so the lanes'
+        // background borders keep the same gap to the glyphs the fills had.
         let row_clearance: Vec<Pixels> = self
             .entries
             .iter()
-            .map(|entry| match node_glyph(&entry.flags) {
-                JjNodeGlyph::WorkingCopy | JjNodeGlyph::Hidden => JJ_GLYPH_CLEARANCE,
-                _ => JJ_NODE_RADIUS,
+            .map(|entry| match elided_glyph(&entry.flags) {
+                JjNodeGlyph::WorkingCopy | JjNodeGlyph::Hidden => {
+                    JJ_GLYPH_CLEARANCE + EDGE_BORDER_WIDTH
+                }
+                _ => JJ_NODE_RADIUS + EDGE_BORDER_WIDTH,
             })
             .collect();
-        let commit_lines: Vec<_> = graph_data
-            .lines
+        // Complete edges (both endpoints in the window): pre-extract their
+        // numeric geometry so the 'static canvas closure can own it (the
+        // EdgeLayouts carry test-only Strings and aren't Clone). Edges whose
+        // vertical reaches the elision limit are dropped here (nodes still
+        // render); the rest are clipped to the visible window.
+        let edge_geoms: Vec<EdgeGeom> = graph_data
+            .edges
             .iter()
-            .filter(|line| {
-                line.full_interval.start <= viewport_range.end
-                    && line.full_interval.end >= viewport_range.start
+            .filter(|edge| edge.column < MAX_EDGE_COLUMN)
+            .filter(|edge| {
+                edge.child_row <= viewport_range.end
+                    && edge.parent_row >= viewport_range.start
             })
-            .cloned()
+            .map(|edge| EdgeGeom {
+                child_row: edge.child_row,
+                parent_row: edge.parent_row,
+                column: edge.column,
+                child_col: edge.child_col,
+                parent_col: edge.parent_col,
+                color_idx: edge.color_idx,
+            })
             .collect();
-
         gpui::canvas(
             move |_bounds, _window, _cx| {},
             move |bounds: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
                 window.paint_layer(bounds, |window| {
                     let accent_colors = cx.theme().accents().clone();
-                    let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
+                    let border_color = lane_border_color(cx);
+                    // Row-center y for a graph row — the node loop's math,
+                    // keyed by absolute row instead of window index.
+                    let row_y = |row: usize| {
+                        bounds.origin.y
+                            + (row as f32 - first_visible_row as f32) * row_height
+                            + row_height / 2.0
+                            - vertical_scroll_offset
+                    };
+                    // Every edge fragment is collected, sorted by
+                    // (layer, sort key), and painted in this single layer:
+                    // the per-line layers that kept crossings clean are
+                    // gone; a border cutting through a crossing is the
+                    // intended look now.
+                    let mut parts: Vec<EdgePart> = Vec::new();
 
                     let status_colors = NodeStatusColors::from_theme(cx.theme().status());
                     for (row_idx, (row, flags)) in
@@ -554,182 +682,102 @@ impl JjLog {
 
                         let commit_x = lane_center_x(bounds, row.lane as f32);
 
-                        let glyph = node_glyph(flags);
+                        let glyph = elided_glyph(flags);
                         let color = node_color(glyph, lane_color, &status_colors);
                         draw_jj_node(glyph, flags, commit_x, row_y_center, color, window, cx);
                     }
 
-                    for line in commit_lines {
-                        let Some((start_segment_idx, start_column)) =
-                            line.get_first_visible_segment_idx(first_visible_row)
-                        else {
-                            continue;
-                        };
+                    // Each edge: up to three parts — the bottom
+                    // stub at the child row, the vertical in `column`, the
+                    // top stub at the parent row. Zero-length parts are
+                    // skipped; stubs start a glyph clearance from the node
+                    // center so borders never cut a glyph.
+                    for edge in &edge_geoms {
+                        let col_x = lane_center_x(bounds, edge.column as f32);
+                        let child_x = lane_center_x(bounds, edge.child_col as f32);
+                        let parent_x = lane_center_x(bounds, edge.parent_col as f32);
+                        // Stub ys sit a row clearance from the node center:
+                        // text glyphs (`@`, `~`) need the wider per-row
+                        // clearance the old builder already used.
+                        let b_y = row_y(edge.child_row)
+                            - row_clearance
+                                .get(edge.child_row)
+                                .copied()
+                                .unwrap_or(B_STUB_OFFSET);
+                        let t_y = row_y(edge.parent_row)
+                            + row_clearance
+                                .get(edge.parent_row)
+                                .copied()
+                                .unwrap_or(T_STUB_OFFSET);
 
-                        let line_x = lane_center_x(bounds, start_column as f32);
+                        let reach = edge.reach();
 
-                        let start_row = line.full_interval.start as i32 - first_visible_row as i32;
-
-                        let from_y =
-                            bounds.origin.y + start_row as f32 * row_height + row_height / 2.0
-                                - vertical_scroll_offset
-                                + row_clearance
-                                    .get(line.full_interval.start)
-                                    .copied()
-                                    .unwrap_or(JJ_NODE_RADIUS);
-
-                        let mut current_row = from_y;
-                        let mut current_column = line_x;
-
-                        let mut builder = PathBuilder::stroke(LINE_WIDTH);
-                        builder.move_to(point(line_x, from_y));
-
-                        let segments = &line.segments[start_segment_idx..];
-                        let desired_curve_height = row_height / 3.0;
-                        let desired_curve_width = LANE_WIDTH / 3.0;
-
-                        for (segment_idx, segment) in segments.iter().enumerate() {
-                            let is_last = segment_idx + 1 == segments.len();
-
-                            match segment {
-                                CommitLineSegment::Straight { to_row } => {
-                                    let mut dest_row = to_row_center(
-                                        to_row - first_visible_row,
-                                        row_height,
-                                        vertical_scroll_offset,
-                                        bounds,
-                                    );
-                                    if is_last {
-                                        dest_row -= row_clearance
-                                            .get(*to_row)
-                                            .copied()
-                                            .unwrap_or(JJ_NODE_RADIUS);
-                                    }
-
-                                    let dest_point = point(current_column, dest_row);
-
-                                    current_row = dest_point.y;
-                                    builder.line_to(dest_point);
-                                    builder.move_to(dest_point);
-                                }
-                                CommitLineSegment::Curve {
-                                    to_column,
-                                    on_row,
-                                    curve_kind,
-                                } => {
-                                    let mut to_column = lane_center_x(bounds, *to_column as f32);
-
-                                    let mut to_row = to_row_center(
-                                        *on_row - first_visible_row,
-                                        row_height,
-                                        vertical_scroll_offset,
-                                        bounds,
-                                    );
-
-                                    // This means that this branch was a checkout
-                                    let going_right = to_column > current_column;
-                                    let column_shift = if going_right {
-                                        JJ_NODE_RADIUS + JJ_NODE_STROKE_WIDTH
-                                    } else {
-                                        -JJ_NODE_RADIUS - JJ_NODE_STROKE_WIDTH
-                                    };
-
-                                    match curve_kind {
-                                        CurveKind::Checkout => {
-                                            if is_last {
-                                                to_column -= column_shift;
-                                            }
-
-                                            let available_curve_width =
-                                                (to_column - current_column).abs();
-                                            let available_curve_height =
-                                                (to_row - current_row).abs();
-                                            let curve_width =
-                                                desired_curve_width.min(available_curve_width);
-                                            let curve_height =
-                                                desired_curve_height.min(available_curve_height);
-                                            let signed_curve_width = if going_right {
-                                                curve_width
-                                            } else {
-                                                -curve_width
-                                            };
-                                            let curve_start =
-                                                point(current_column, to_row - curve_height);
-                                            let curve_end =
-                                                point(current_column + signed_curve_width, to_row);
-                                            let curve_control = point(current_column, to_row);
-
-                                            builder.move_to(point(current_column, current_row));
-                                            builder.line_to(curve_start);
-                                            builder.move_to(curve_start);
-                                            builder.curve_to(curve_end, curve_control);
-                                            builder.move_to(curve_end);
-                                            builder.line_to(point(to_column, to_row));
-                                        }
-                                        CurveKind::Merge => {
-                                            if is_last {
-                                                to_row -= row_clearance
-                                                    .get(*on_row)
-                                                    .copied()
-                                                    .unwrap_or(JJ_NODE_RADIUS);
-                                            }
-
-                                            let merge_start = point(
-                                                current_column + column_shift,
-                                                current_row - JJ_NODE_RADIUS,
-                                            );
-                                            let available_curve_width =
-                                                (to_column - merge_start.x).abs();
-                                            let available_curve_height =
-                                                (to_row - merge_start.y).abs();
-                                            let curve_width =
-                                                desired_curve_width.min(available_curve_width);
-                                            let curve_height =
-                                                desired_curve_height.min(available_curve_height);
-                                            let signed_curve_width = if going_right {
-                                                curve_width
-                                            } else {
-                                                -curve_width
-                                            };
-                                            let curve_start = point(
-                                                to_column - signed_curve_width,
-                                                merge_start.y,
-                                            );
-                                            let curve_end =
-                                                point(to_column, merge_start.y + curve_height);
-                                            let curve_control = point(to_column, merge_start.y);
-
-                                            builder.move_to(merge_start);
-                                            builder.line_to(curve_start);
-                                            builder.move_to(curve_start);
-                                            builder.curve_to(curve_end, curve_control);
-                                            builder.move_to(curve_end);
-                                            builder.line_to(point(to_column, to_row));
-                                        }
-                                    }
-                                    current_row = to_row;
-                                    current_column = to_column;
-                                    builder.move_to(point(current_column, current_row));
-                                }
-                            }
+                        if child_x != col_x {
+                            let (stub_start, stub_end) = if child_x < col_x {
+                                (child_x + JJ_EDGE_CLEARANCE, col_x)
+                            } else {
+                                (col_x, child_x - JJ_EDGE_CLEARANCE)
+                            };
+                            let mut lane = LaneEdge::new();
+                            lane.move_to(point(stub_start, b_y));
+                            lane.line_to(point(stub_end, b_y));
+                            parts.push(EdgePart {
+                                layer: LAYER_BT,
+                                sort_key: reach,
+                                lane,
+                                color_idx: edge.color_idx,
+                            });
                         }
 
-                        builder.close();
-                        lines.entry(line.color_idx).or_default().push(builder);
+                        if b_y != t_y {
+                            let mut lane = LaneEdge::new();
+                            lane.move_to(point(col_x, b_y));
+                            lane.line_to(point(col_x, t_y));
+                            parts.push(EdgePart {
+                                layer: LAYER_V,
+                                sort_key: edge.column,
+                                lane,
+                                color_idx: edge.color_idx,
+                            });
+                        }
+
+                        if parent_x != col_x {
+                            let (stub_start, stub_end) = if col_x < parent_x {
+                                (col_x, parent_x - JJ_EDGE_CLEARANCE)
+                            } else {
+                                (parent_x + JJ_EDGE_CLEARANCE, col_x)
+                            };
+                            let mut lane = LaneEdge::new();
+                            lane.move_to(point(stub_start, t_y));
+                            lane.line_to(point(stub_end, t_y));
+                            parts.push(EdgePart {
+                                layer: LAYER_BT,
+                                sort_key: reach,
+                                lane,
+                                color_idx: edge.color_idx,
+                            });
+                        }
                     }
 
-                    for (color_idx, builders) in lines {
-                        let line_color = accent_colors.color_for_index(color_idx as u32);
+                    // Verticals paint before stubs; within a layer the sort
+                    // key is descending — wider column, longer reach first —
+                    // so the shorter/inner fragments end up in front.
+                    parts.sort_by(|a, b| {
+                        a.layer
+                            .cmp(&b.layer)
+                            .then_with(|| b.sort_key.cmp(&a.sort_key))
+                    });
 
-                        for builder in builders {
-                            if let Ok(path) = builder.build() {
-                                // we paint each color on it's own layer to stop
-                                // overlapping lines of different colors changing
-                                // the color of a line
-                                window.paint_layer(bounds, |window| {
-                                    window.paint_path(path, line_color);
-                                });
-                            }
+                    for EdgePart {
+                        lane,
+                        color_idx,
+                        ..
+                    } in parts
+                    {
+                        let line_color = accent_colors.color_for_index(color_idx as u32);
+                        if let (Ok(border), Ok(fill)) = (lane.border.build(), lane.fill.build()) {
+                            window.paint_path(border, border_color);
+                            window.paint_path(fill, line_color);
                         }
                     }
                 })
@@ -753,6 +801,74 @@ fn format_timestamp(timestamp: i64) -> String {
     local_datetime
         .format(timestamp_format())
         .unwrap_or_default()
+}
+
+/// The `(elided revisions)` rows the graph needs: one directly after each
+/// entry that has a parent change id outside the emitted window (its parent
+/// never appears in the log), even when several parents are missing — they
+/// all land on that one row. Real entries keep their order and content; the
+/// synthetic rows carry a fresh `elided-{n}` change id (real change ids are
+/// base-62 and never match), the `elided` flag, and no text of their own.
+///
+/// Must run before `JjGraphData::from_entries`: the layout lands dangling
+/// edges on these rows, and the stored entry list must be the synthesized
+/// one, or the table and the canvas disagree on row indices.
+fn synthesize_elided_entries(entries: Vec<JjLogEntry>) -> Vec<JjLogEntry> {
+    // Owned: the loop below moves `entries`, so the window's id set cannot
+    // borrow from it.
+    let emitted: HashSet<String> = entries
+        .iter()
+        .map(|entry| entry.change_id.to_string())
+        .collect();
+    let mut rows = Vec::with_capacity(entries.len());
+    let mut elided_count = 0;
+    for entry in entries {
+        let dangling = !entry.flags.elided
+            && entry
+                .parent_change_ids
+                .iter()
+                .any(|parent| !emitted.contains(parent.as_str()));
+        rows.push(entry);
+        if dangling {
+            rows.push(elided_entry(elided_count));
+            elided_count += 1;
+        }
+    }
+    rows
+}
+
+/// The `n`-th synthetic `(elided revisions)` row.
+fn elided_entry(index: usize) -> JjLogEntry {
+    JjLogEntry {
+        change_id: format!("elided-{index}").into(),
+        commit_id: SharedString::default(),
+        parents: Vec::new(),
+        parent_change_ids: Vec::new(),
+        bookmarks: Vec::new(),
+        tags: Vec::new(),
+        description: SharedString::default(),
+        author_name: SharedString::default(),
+        author_email: SharedString::default(),
+        commit_timestamp: 0,
+        flags: JjLogFlags {
+            elided: true,
+            ..Default::default()
+        },
+        is_merge: false,
+        is_head: false,
+        dist_to_head: None,
+    }
+}
+
+/// A row's node glyph: the synthetic elided rows render as the hidden wave
+/// mark — `node_glyph` (in `jj_graph`, layout-only) doesn't know the
+/// `elided` flag, so the panel maps it here.
+fn elided_glyph(flags: &JjLogFlags) -> JjNodeGlyph {
+    if flags.elided {
+        JjNodeGlyph::Hidden
+    } else {
+        node_glyph(flags)
+    }
 }
 
 impl Render for JjLog {
@@ -991,6 +1107,7 @@ impl Render for JjLog {
                                                     range
                                                         .map(|idx| {
                                                             let entry = &entries[idx];
+                                                            let elided = entry.flags.elided;
                                                             let accent_color = accent_colors
                                                                 .0
                                                                 .get(color_idxs[idx])
@@ -1021,6 +1138,11 @@ impl Render for JjLog {
                                                             // Description cell with bookmark
                                                             // chips inline, mirroring
                                                             // GitGraph's render_table_rows.
+                                                            // Elided rows are the
+                                                            // cut-off marker itself:
+                                                            // "(elided revisions)", no
+                                                            // chips, placeholder, or
+                                                            // other text.
                                                             let description_cell = div()
                                                                 .overflow_hidden()
                                                                 .child(
@@ -1050,7 +1172,9 @@ impl Render for JjLog {
                                                                                 })
                                                                         )
                                                                         .child(
-                                                                            Label::new(if has_description {
+                                                                            Label::new(if elided {
+                                                                                "(elided revisions)"
+                                                                            } else if has_description {
                                                                                 description
                                                                             } else {
                                                                                 "(no description set)"
@@ -1060,24 +1184,42 @@ impl Render for JjLog {
                                                                         ),
                                                                 )
                                                                 .into_any_element();
+                                                            // Elided rows carry no
+                                                            // date, author, or commit
+                                                            // text — the marker is the
+                                                            // row.
                                                             let cells = vec![
                                                                 description_cell,
-                                                                column_label(timestamp.into()),
-                                                                column_label(
-                                                                    entry
-                                                                        .author_name
-                                                                        .to_string()
-                                                                        .into(),
-                                                                ),
-                                                                column_label(change_short.into()),
+                                                                if elided {
+                                                                    column_label("".into())
+                                                                } else {
+                                                                    column_label(timestamp.into())
+                                                                },
+                                                                if elided {
+                                                                    column_label("".into())
+                                                                } else {
+                                                                    column_label(
+                                                                        entry
+                                                                            .author_name
+                                                                            .to_string()
+                                                                            .into(),
+                                                                    )
+                                                                },
+                                                                if elided {
+                                                                    column_label("".into())
+                                                                } else {
+                                                                    column_label(change_short.into())
+                                                                },
                                                             ];
-                                                            // Hidden commits read as
-                                                            // elided: the row is real
-                                                            // (jj renders full rows for
-                                                            // hidden commits named in the
-                                                            // revset) but faded like jj's
-                                                            // dimmed hidden text.
-                                                            if entry.flags.hidden {
+                                                            // Hidden commits and the
+                                                            // synthesized elided rows
+                                                            // read as dimmed: the row
+                                                            // is real (jj renders full
+                                                            // rows for hidden commits
+                                                            // named in the revset)
+                                                            // but faded like jj's
+                                                            // dimmed text.
+                                                            if entry.flags.hidden || elided {
                                                                 cells
                                                                     .into_iter()
                                                                     .map(|cell| {
@@ -1293,5 +1435,115 @@ mod persistence {
                 WHERE item_id = ? AND workspace_id = ?
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_entry(change_id: &str, parents: &[&str]) -> JjLogEntry {
+        JjLogEntry {
+            change_id: change_id.into(),
+            commit_id: format!("commit-{change_id}").into(),
+            parents: Vec::new(),
+            parent_change_ids: parents
+                .iter()
+                .map(|parent| (*parent).into())
+                .collect(),
+            bookmarks: Vec::new(),
+            tags: Vec::new(),
+            description: SharedString::default(),
+            author_name: SharedString::default(),
+            author_email: SharedString::default(),
+            commit_timestamp: 0,
+            flags: JjLogFlags::default(),
+            is_merge: parents.len() > 1,
+            is_head: false,
+            dist_to_head: None,
+        }
+    }
+
+    #[test]
+    fn synthesis_inserts_an_elided_row_after_each_dangling_entry() {
+        // The C1 fixture: @ merges two branches, each of whose next row has
+        // its parent outside the window. One elided row per dangling entry,
+        // directly after it — 6 rows, elided at indices 2 and 4.
+        let mut at = test_entry("kozmttlk", &["rzvnrvrz", "xpzmvpqp"]);
+        at.flags.working_copy = true;
+        let entries = vec![
+            at,
+            test_entry("xpzmvpqp", &["uktnvvqq"]),
+            test_entry("rzvnrvrz", &["rz-out"]),
+            test_entry("root", &[]),
+        ];
+        let rows = synthesize_elided_entries(entries);
+        let ids: Vec<&str> = rows.iter().map(|row| row.change_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["kozmttlk", "xpzmvpqp", "elided-0", "rzvnrvrz", "elided-1", "root"]
+        );
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.flags.elided, index == 2 || index == 4);
+        }
+        // Synthetic rows carry no text of their own.
+        for row in [&rows[2], &rows[4]] {
+            assert!(row.description.is_empty());
+            assert!(row.author_name.is_empty());
+            assert_eq!(row.commit_timestamp, 0);
+            assert!(row.parent_change_ids.is_empty());
+            assert!(row.bookmarks.is_empty());
+        }
+    }
+
+    #[test]
+    fn synthesis_leaves_a_complete_window_alone() {
+        // Every parent present: no elided rows, order untouched.
+        let entries = vec![
+            test_entry("c", &["b"]),
+            test_entry("b", &["a"]),
+            test_entry("a", &[]),
+        ];
+        let rows = synthesize_elided_entries(entries);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| !row.flags.elided));
+        let ids: Vec<&str> = rows.iter().map(|row| row.change_id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn synthesis_elides_the_last_rows_dangling_parent() {
+        // The oldest emitted entry's parent is outside the window: the
+        // dangling edge still gets its elided row.
+        let entries = vec![
+            test_entry("b", &["outside"]),
+            test_entry("a", &["outside-too"]),
+        ];
+        let rows = synthesize_elided_entries(entries);
+        assert_eq!(rows.len(), 4);
+        assert!(rows[1].flags.elided && rows[3].flags.elided);
+        assert!(!rows[0].flags.elided && !rows[2].flags.elided);
+    }
+
+    #[test]
+    fn synthesis_uses_one_row_for_several_missing_parents() {
+        let entries = vec![test_entry("m", &["out-1", "out-2"]), test_entry("a", &[])];
+        let rows = synthesize_elided_entries(entries);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[1].flags.elided);
+        assert!(!rows[0].flags.elided && !rows[2].flags.elided);
+    }
+
+    #[test]
+    fn edge_reach_is_the_widest_column_touched() {
+        let geom = EdgeGeom {
+            child_row: 0,
+            parent_row: 3,
+            column: 1,
+            child_col: 4,
+            parent_col: 0,
+            color_idx: 0,
+        };
+        assert_eq!(geom.reach(), 4);
     }
 }
