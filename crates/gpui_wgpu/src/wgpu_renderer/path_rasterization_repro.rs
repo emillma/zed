@@ -285,6 +285,17 @@ fn rasterize(
             immediate_size: 0,
         })
     };
+    // Same specialization as `WgpuRenderer::create_pipelines`: the analytic
+    // stroke coverage is disabled for MSAA pipelines, so each sample count
+    // exercises its own code path.
+    let stroke_aa = [(
+        "STROKE_ANALYTIC_AA",
+        if sample_count == 1 { 1.0 } else { 0.0 },
+    )];
+    let stroke_aa_options = wgpu::PipelineCompilationOptions {
+        constants: &stroke_aa,
+        ..Default::default()
+    };
     let path_rasterization = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("repro_path_rasterization"),
         layout: Some(&raster_layout),
@@ -292,7 +303,7 @@ fn rasterize(
             module: &shader_module,
             entry_point: Some("vs_path_rasterization"),
             buffers: &[],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: stroke_aa_options.clone(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader_module,
@@ -302,7 +313,7 @@ fn rasterize(
                 blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: stroke_aa_options,
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,

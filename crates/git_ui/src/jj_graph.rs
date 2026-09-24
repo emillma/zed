@@ -28,8 +28,8 @@
 //! Mutable commits are hollow rings, immutable ones filled diamonds —
 //! jj's filled-vs-hollow distinction.
 //!
-//! `@` and `~` are painted as real text glyphs (jj renders them as
-//! characters in the terminal); `◆`/`×`/`○` are vector shapes.
+//! `@` is a real text glyph (jj renders it as a character in the
+//! terminal); `~` is a drawn wave; `◆`/`×`/`○` are vector shapes.
 //!
 //! (`json()`/`stringify()` strip jj's own color labels, so all styling is
 //! flag-driven — see `jjlog_graph.py`'s coloring note.)
@@ -42,7 +42,8 @@ use std::{collections::HashMap, ops::Range, rc::Rc};
 use smallvec::SmallVec;
 
 use git::jj::{JjLogEntry, JjLogFlags};
-use gpui::{App, Pixels, Window, point, px};
+use gpui::{App, PathStyle, Pixels, Window, point, px};
+use lyon::tessellation::{LineCap, LineJoin};
 use theme::StatusColors;
 
 use crate::git_graph::{CommitLineSegment, CurveKind, LINE_WIDTH};
@@ -518,18 +519,26 @@ pub(crate) fn node_color(
 /// Node geometry for the jj panel's graph — decoupled from GitGraph's
 /// constants so the jj nodes can scale independently.
 pub(crate) const JJ_NODE_RADIUS: Pixels = px(4.5);
-pub(crate) const JJ_NODE_STROKE_WIDTH: Pixels = px(2.5);
+pub(crate) const JJ_NODE_STROKE_WIDTH: Pixels = px(2.0);
 /// Vertical clearance between a node and the lane lines' endpoints: text
 /// glyphs (`@`, `~`) need more room than the circles so the lines don't
 /// cross them.
 pub(crate) const JJ_GLYPH_CLEARANCE: Pixels = px(6.5);
 
-/// Font size for the `@` glyph — sized to read at the lane scale (the
-/// commit ring is 4.5px radius).
-const NODE_GLYPH_FONT_SIZE: Pixels = px(13.0);
-/// The `~` glyph runs bigger and bolder than the `@`: a tilde is visually
-/// light for its em size, so it needs the head start to read as a node.
-const NODE_TILDE_FONT_SIZE: Pixels = px(16.0);
+/// Font size for the `@` glyph — sized to read at the lane scale without
+/// touching the lane lines (the commit ring is 4.5px radius).
+const NODE_GLYPH_FONT_SIZE: Pixels = px(12.0);
+
+/// A stroke path builder with round caps and joins — the node marks read
+/// softer than lyon's default butt caps.
+fn round_stroke_builder(width: Pixels) -> gpui::PathBuilder {
+    gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
+        gpui::StrokeOptions::default()
+            .with_line_width(f32::from(width))
+            .with_line_cap(LineCap::Round)
+            .with_line_join(LineJoin::Round),
+    ))
+}
 
 /// Paints a single character centered on the node position, as jj's graph
 /// renders `@`/`~` in the terminal: real glyphs from Zed's bundled UI font.
@@ -537,8 +546,6 @@ const NODE_TILDE_FONT_SIZE: Pixels = px(16.0);
 /// ascent+descent box inside it); the constant is tuned visually.
 fn paint_node_glyph(
     text: &str,
-    font_size: Pixels,
-    weight: gpui::FontWeight,
     center_x: Pixels,
     center_y: Pixels,
     color: gpui::Hsla,
@@ -548,7 +555,7 @@ fn paint_node_glyph(
     let run = gpui::TextRun {
         len: text.len(),
         font: gpui::Font {
-            weight,
+            weight: gpui::FontWeight::MEDIUM,
             ..gpui::font(".ZedSans")
         },
         color,
@@ -556,10 +563,13 @@ fn paint_node_glyph(
         underline: None,
         strikethrough: None,
     };
-    let line = window
-        .text_system()
-        .shape_line(text.to_string().into(), font_size, &[run], None);
-    let line_height = font_size * 1.2;
+    let line = window.text_system().shape_line(
+        text.to_string().into(),
+        NODE_GLYPH_FONT_SIZE,
+        &[run],
+        None,
+    );
+    let line_height = NODE_GLYPH_FONT_SIZE * 1.2;
     let origin = point(center_x - line.width() / 2.0, center_y - line_height / 2.0);
     line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx)
         .ok();
@@ -608,16 +618,7 @@ pub(crate) fn draw_jj_node(
         }
         // `@`: the working copy, as jj's literal character.
         JjNodeGlyph::WorkingCopy => {
-            paint_node_glyph(
-                "@",
-                NODE_GLYPH_FONT_SIZE,
-                gpui::FontWeight::MEDIUM,
-                center_x,
-                center_y,
-                color,
-                window,
-                cx,
-            );
+            paint_node_glyph("@", center_x, center_y, color, window, cx);
         }
         // `◆`: filled diamond.
         JjNodeGlyph::Immutable => {
@@ -635,8 +636,8 @@ pub(crate) fn draw_jj_node(
         // `×`: two crossed strokes — arms stay inside the ring radius so
         // the mark reads compact next to the circles.
         JjNodeGlyph::Conflict => {
-            let r = radius * 0.75;
-            let mut builder = gpui::PathBuilder::stroke(LINE_WIDTH);
+            let r = radius * 0.65;
+            let mut builder = round_stroke_builder(LINE_WIDTH);
             builder.move_to(point(center_x - r, center_y - r));
             builder.line_to(point(center_x + r, center_y + r));
             builder.move_to(point(center_x - r, center_y + r));
@@ -646,18 +647,24 @@ pub(crate) fn draw_jj_node(
                 window.paint_path(path, color);
             }
         }
-        // `~`: hidden, as jj's elision character.
+        // `~`: hidden — a drawn wave; the font tilde is too light at node
+        // scale. Peak left of center, trough right, like jj's elision mark.
         JjNodeGlyph::Hidden => {
-            paint_node_glyph(
-                "~",
-                NODE_TILDE_FONT_SIZE,
-                gpui::FontWeight::BOLD,
-                center_x,
-                center_y,
-                color,
-                window,
-                cx,
+            let w = radius * 2.2;
+            let a = radius * 0.5;
+            let mut builder = round_stroke_builder(JJ_NODE_STROKE_WIDTH);
+            builder.move_to(point(center_x - w / 2.0, center_y + a * 0.6));
+            builder.curve_to(
+                point(center_x, center_y - a * 0.6),
+                point(center_x - w / 4.0, center_y - a * 1.8),
             );
+            builder.curve_to(
+                point(center_x + w / 2.0, center_y + a * 0.6),
+                point(center_x + w / 4.0, center_y + a * 1.8),
+            );
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
         }
     }
 }

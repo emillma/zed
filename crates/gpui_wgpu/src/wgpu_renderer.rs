@@ -860,6 +860,21 @@ impl WgpuRenderer {
                 immediate_size: 0,
             });
 
+            // `STROKE_ANALYTIC_AA` (see `shaders.wgsl`) is specialized per
+            // pipeline: the analytic stroke coverage is only enabled at one
+            // sample, where there is no geometric antialiasing to compose
+            // with. `path_rasterization` is the only pipeline created with a
+            // sample count above 1, so the value follows `sample_count`;
+            // other entry points never read the constant.
+            let stroke_aa = [(
+                "STROKE_ANALYTIC_AA",
+                if sample_count == 1 { 1.0 } else { 0.0 },
+            )];
+            let compilation_options = wgpu::PipelineCompilationOptions {
+                constants: &stroke_aa,
+                ..Default::default()
+            };
+
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(name),
                 layout: Some(&pipeline_layout),
@@ -867,13 +882,13 @@ impl WgpuRenderer {
                     module,
                     entry_point: Some(vs_entry),
                     buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    compilation_options: compilation_options.clone(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module,
                     entry_point: Some(fs_entry),
                     targets: color_targets,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    compilation_options,
                 }),
                 primitive: wgpu::PrimitiveState {
                     topology,

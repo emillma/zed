@@ -1047,6 +1047,13 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
 
 // --- path rasterization --- //
 
+// Pipeline-overridable constant, specialized per pipeline (see
+// `WgpuRenderer::create_pipelines`): 1 = analytic per-fragment stroke
+// coverage in `fs_path_rasterization`, 0 = coverage purely from sample
+// geometry (MSAA). Specialized to 0 for any pipeline with more than one
+// sample, where the two would compose multiplicatively.
+override STROKE_ANALYTIC_AA: i32 = 1;
+
 struct PathRasterizationVertex {
     xy_position: vec2<f32>,
     st_position: vec2<f32>,
@@ -1093,15 +1100,21 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         // Stroked path: st.x is the signed distance from the path centerline,
         // normalized by the half stroke width (±1 on the two edges, 0 on the
         // centerline). st.y == 0.0 is the stroke-mode flag.
-        let d = abs(input.st_position.x);
-        let gradient_length = length(vec2<f32>(dx.x, dy.x));
-        if (gradient_length < 0.001) {
-            alpha = 1.0;
+        if (STROKE_ANALYTIC_AA == 1) {
+            let d = abs(input.st_position.x);
+            let gradient_length = length(vec2<f32>(dx.x, dy.x));
+            if (gradient_length < 0.001) {
+                alpha = 1.0;
+            } else {
+                // Distance in pixels to the nearest stroke edge, converted to
+                // analytic coverage at the fragment (0.5 at the edge, ramping to
+                // 0 half a pixel outside and 1 half a pixel inside).
+                alpha = saturate(0.5 + (1.0 - d) / gradient_length);
+            }
         } else {
-            // Distance in pixels to the nearest stroke edge, converted to
-            // analytic coverage at the fragment (0.5 at the edge, ramping to
-            // 0 half a pixel outside and 1 half a pixel inside).
-            alpha = saturate(0.5 + (1.0 - d) / gradient_length);
+            // MSAA pipeline: geometric sample coverage is the antialiasing;
+            // the analytic alpha would compose multiplicatively with it.
+            alpha = 1.0;
         }
     } else {
         alpha = 1.0; // Legacy: constant-st paths (fills) stay fully covered.

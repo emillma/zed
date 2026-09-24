@@ -7218,6 +7218,7 @@ dependencies = [
  "language",
  "language_model",
  "log",
+ "lyon",
  "markdown",
  "menu",
  "multi_buffer",
