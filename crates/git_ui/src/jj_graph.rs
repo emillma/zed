@@ -28,8 +28,8 @@
 //! Mutable commits are hollow rings, immutable ones filled diamonds —
 //! jj's filled-vs-hollow distinction.
 //!
-//! `@` is a real text glyph (jj renders it as a character in the
-//! terminal); `~` is a drawn wave; `◆`/`×`/`○` are vector shapes.
+//! `@` and `~` are monochrome SVG marks tinted at paint time (Lucide's
+//! at-sign; a hand-drawn wave); `◆`/`×`/`○` are vector shapes.
 //!
 //! (`json()`/`stringify()` strip jj's own color labels, so all styling is
 //! flag-driven — see `jjlog_graph.py`'s coloring note.)
@@ -42,7 +42,7 @@ use std::{collections::HashMap, ops::Range, rc::Rc};
 use smallvec::SmallVec;
 
 use git::jj::{JjLogEntry, JjLogFlags};
-use gpui::{App, PathStyle, Pixels, Window, point, px};
+use gpui::{App, PathStyle, Pixels, SharedString, TransformationMatrix, Window, point, px};
 use lyon::tessellation::{LineCap, LineJoin};
 use theme::StatusColors;
 
@@ -525,9 +525,16 @@ pub(crate) const JJ_NODE_STROKE_WIDTH: Pixels = px(2.0);
 /// cross them.
 pub(crate) const JJ_GLYPH_CLEARANCE: Pixels = px(6.5);
 
-/// Font size for the `@` glyph — sized to read at the lane scale without
-/// touching the lane lines (the commit ring is 4.5px radius).
-const NODE_GLYPH_FONT_SIZE: Pixels = px(12.0);
+/// Rendered box sizes for the SVG node marks — tuned so the ink clears
+/// the lane lines (the commit ring is 4.5px radius).
+const AT_SIGN_SIZE: Pixels = px(13.0);
+const WAVE_SIZE: Pixels = px(12.0);
+
+/// Node marks as monochrome SVGs, tinted with the node color at paint
+/// time. The `@` is Lucide's at-sign (ISC); the wave is hand-drawn to read
+/// as jj's elision mark at node scale.
+const AT_SIGN_SVG: &str = include_str!("../assets/jj_at_sign.svg");
+const WAVE_SVG: &str = include_str!("../assets/jj_wave.svg");
 
 /// A stroke path builder with round caps and joins — the node marks read
 /// softer than lyon's default butt caps.
@@ -540,38 +547,35 @@ fn round_stroke_builder(width: Pixels) -> gpui::PathBuilder {
     ))
 }
 
-/// Paints a single character centered on the node position, as jj's graph
-/// renders `@`/`~` in the terminal: real glyphs from Zed's bundled UI font.
-/// The glyph box is centered via a 1.2em line height (paint_line centers the
-/// ascent+descent box inside it); the constant is tuned visually.
-fn paint_node_glyph(
-    text: &str,
+/// Paints a monochrome node SVG centered on the node position, tinted with
+/// the node color.
+fn paint_node_svg(
+    svg: &'static str,
+    name: &'static str,
+    size: Pixels,
     center_x: Pixels,
     center_y: Pixels,
     color: gpui::Hsla,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let run = gpui::TextRun {
-        len: text.len(),
-        font: gpui::Font {
-            weight: gpui::FontWeight::MEDIUM,
-            ..gpui::font(".ZedSans")
+    let half = size / 2.0;
+    let bounds = gpui::Bounds::new(
+        point(center_x - half, center_y - half),
+        gpui::Size {
+            width: size,
+            height: size,
         },
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let line = window.text_system().shape_line(
-        text.to_string().into(),
-        NODE_GLYPH_FONT_SIZE,
-        &[run],
-        None,
     );
-    let line_height = NODE_GLYPH_FONT_SIZE * 1.2;
-    let origin = point(center_x - line.width() / 2.0, center_y - line_height / 2.0);
-    line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx)
+    window
+        .paint_svg(
+            bounds,
+            SharedString::from(name),
+            Some(svg.as_bytes()),
+            TransformationMatrix::unit(),
+            color,
+            cx,
+        )
         .ok();
 }
 
@@ -618,7 +622,16 @@ pub(crate) fn draw_jj_node(
         }
         // `@`: the working copy, as jj's literal character.
         JjNodeGlyph::WorkingCopy => {
-            paint_node_glyph("@", center_x, center_y, color, window, cx);
+            paint_node_svg(
+                AT_SIGN_SVG,
+                "jj-at-sign",
+                AT_SIGN_SIZE,
+                center_x,
+                center_y,
+                color,
+                window,
+                cx,
+            );
         }
         // `◆`: filled diamond.
         JjNodeGlyph::Immutable => {
@@ -647,24 +660,11 @@ pub(crate) fn draw_jj_node(
                 window.paint_path(path, color);
             }
         }
-        // `~`: hidden — a drawn wave; the font tilde is too light at node
-        // scale. Peak left of center, trough right, like jj's elision mark.
+        // `~`: hidden — the wave mark.
         JjNodeGlyph::Hidden => {
-            let w = radius * 2.2;
-            let a = radius * 0.5;
-            let mut builder = round_stroke_builder(JJ_NODE_STROKE_WIDTH);
-            builder.move_to(point(center_x - w / 2.0, center_y + a * 0.6));
-            builder.curve_to(
-                point(center_x, center_y - a * 0.6),
-                point(center_x - w / 4.0, center_y - a * 1.8),
+            paint_node_svg(
+                WAVE_SVG, "jj-wave", WAVE_SIZE, center_x, center_y, color, window, cx,
             );
-            builder.curve_to(
-                point(center_x + w / 2.0, center_y + a * 0.6),
-                point(center_x + w / 4.0, center_y + a * 1.8),
-            );
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, color);
-            }
         }
     }
 }
