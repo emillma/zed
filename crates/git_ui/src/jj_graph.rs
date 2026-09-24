@@ -45,9 +45,7 @@ use git::jj::{JjLogEntry, JjLogFlags};
 use gpui::{App, Pixels, Window, point, px};
 use theme::StatusColors;
 
-use crate::git_graph::{
-    COMMIT_CIRCLE_RADIUS, COMMIT_CIRCLE_STROKE_WIDTH, CommitLineSegment, CurveKind, LINE_WIDTH,
-};
+use crate::git_graph::{CommitLineSegment, CurveKind, LINE_WIDTH};
 
 /// One row of the lane graph, aligned by index with the panel's `entries`.
 #[derive(Debug)]
@@ -517,9 +515,18 @@ pub(crate) fn node_color(
     }
 }
 
+/// Node geometry for the jj panel's graph — decoupled from GitGraph's
+/// constants so the jj nodes can scale independently.
+pub(crate) const JJ_NODE_RADIUS: Pixels = px(4.5);
+pub(crate) const JJ_NODE_STROKE_WIDTH: Pixels = px(2.5);
+/// Vertical clearance between a node and the lane lines' endpoints: text
+/// glyphs (`@`, `~`) need more room than the circles so the lines don't
+/// cross them.
+pub(crate) const JJ_GLYPH_CLEARANCE: Pixels = px(6.5);
+
 /// Font size for the text-glyph nodes (`@`, `~`) — sized to read at the
-/// lane scale (the commit dot is 3.5px radius).
-const NODE_GLYPH_FONT_SIZE: Pixels = px(11.0);
+/// lane scale (the commit ring is 4.5px radius).
+const NODE_GLYPH_FONT_SIZE: Pixels = px(13.0);
 
 /// Paints a single character centered on the node position, as jj's graph
 /// renders `@`/`~` in the terminal: real glyphs from Zed's bundled UI font.
@@ -535,7 +542,10 @@ fn paint_node_glyph(
 ) {
     let run = gpui::TextRun {
         len: text.len(),
-        font: gpui::font(".ZedSans"),
+        font: gpui::Font {
+            weight: gpui::FontWeight::MEDIUM,
+            ..gpui::font(".ZedSans")
+        },
         color,
         background_color: None,
         underline: None,
@@ -557,7 +567,8 @@ fn paint_node_glyph(
 /// approved v2 base, hollow ring), `◆` immutable (filled diamond), `@`
 /// working copy and
 /// `~` hidden as real text glyphs, `×` conflict (crossed strokes).
-/// `empty` fades whatever glyph applies to 40% opacity.
+/// `empty` fades normal/immutable glyphs to 40% opacity — never conflict,
+/// working copy or hidden, whose states must stay loud.
 pub(crate) fn draw_jj_node(
     glyph: JjNodeGlyph,
     flags: &JjLogFlags,
@@ -567,8 +578,12 @@ pub(crate) fn draw_jj_node(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let color = if flags.empty { color.alpha(0.4) } else { color };
-    let radius = COMMIT_CIRCLE_RADIUS;
+    let color = if flags.empty && matches!(glyph, JjNodeGlyph::Normal | JjNodeGlyph::Immutable) {
+        color.alpha(0.4)
+    } else {
+        color
+    };
+    let radius = JJ_NODE_RADIUS;
 
     match glyph {
         // `○`: hollow ring — mutable commits are hollow, immutable (◆)
@@ -585,7 +600,7 @@ pub(crate) fn draw_jj_node(
             window.paint_quad(
                 gpui::fill(bounds, gpui::transparent_black())
                     .corner_radii(radius)
-                    .border_widths(COMMIT_CIRCLE_STROKE_WIDTH)
+                    .border_widths(JJ_NODE_STROKE_WIDTH)
                     .border_color(color),
             );
         }

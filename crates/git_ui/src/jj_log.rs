@@ -1,8 +1,11 @@
 use crate::git_graph::{
-    COMMIT_CIRCLE_RADIUS, COMMIT_CIRCLE_STROKE_WIDTH, CommitLineSegment, CurveKind, LANE_WIDTH,
-    LEFT_PADDING, LINE_WIDTH, accent_colors_count, lane_center_x, timestamp_format, to_row_center,
+    CommitLineSegment, CurveKind, LANE_WIDTH, LEFT_PADDING, LINE_WIDTH, accent_colors_count,
+    lane_center_x, timestamp_format, to_row_center,
 };
-use crate::jj_graph::{JjGraphData, NodeStatusColors, draw_jj_node, node_color, node_glyph};
+use crate::jj_graph::{
+    JJ_GLYPH_CLEARANCE, JJ_NODE_RADIUS, JJ_NODE_STROKE_WIDTH, JjGraphData, JjNodeGlyph,
+    NodeStatusColors, draw_jj_node, node_color, node_glyph,
+};
 use crate::jj_settings::JjSettings;
 use anyhow::Result;
 use editor::Editor;
@@ -512,6 +515,17 @@ impl JjLog {
             .iter()
             .map(|entry| entry.flags.clone())
             .collect();
+        // Per-row vertical clearance where lane lines start/end (absolute-row
+        // indexed): text glyphs (`@`, `~`) need more room than the circles so
+        // the lines don't cross them.
+        let row_clearance: Vec<Pixels> = self
+            .entries
+            .iter()
+            .map(|entry| match node_glyph(&entry.flags) {
+                JjNodeGlyph::WorkingCopy | JjNodeGlyph::Hidden => JJ_GLYPH_CLEARANCE,
+                _ => JJ_NODE_RADIUS,
+            })
+            .collect();
         let commit_lines: Vec<_> = graph_data
             .lines
             .iter()
@@ -559,7 +573,10 @@ impl JjLog {
                         let from_y =
                             bounds.origin.y + start_row as f32 * row_height + row_height / 2.0
                                 - vertical_scroll_offset
-                                + COMMIT_CIRCLE_RADIUS;
+                                + row_clearance
+                                    .get(line.full_interval.start)
+                                    .copied()
+                                    .unwrap_or(JJ_NODE_RADIUS);
 
                         let mut current_row = from_y;
                         let mut current_column = line_x;
@@ -583,7 +600,10 @@ impl JjLog {
                                         bounds,
                                     );
                                     if is_last {
-                                        dest_row -= COMMIT_CIRCLE_RADIUS;
+                                        dest_row -= row_clearance
+                                            .get(*to_row)
+                                            .copied()
+                                            .unwrap_or(JJ_NODE_RADIUS);
                                     }
 
                                     let dest_point = point(current_column, dest_row);
@@ -609,9 +629,9 @@ impl JjLog {
                                     // This means that this branch was a checkout
                                     let going_right = to_column > current_column;
                                     let column_shift = if going_right {
-                                        COMMIT_CIRCLE_RADIUS + COMMIT_CIRCLE_STROKE_WIDTH
+                                        JJ_NODE_RADIUS + JJ_NODE_STROKE_WIDTH
                                     } else {
-                                        -COMMIT_CIRCLE_RADIUS - COMMIT_CIRCLE_STROKE_WIDTH
+                                        -JJ_NODE_RADIUS - JJ_NODE_STROKE_WIDTH
                                     };
 
                                     match curve_kind {
@@ -648,12 +668,15 @@ impl JjLog {
                                         }
                                         CurveKind::Merge => {
                                             if is_last {
-                                                to_row -= COMMIT_CIRCLE_RADIUS;
+                                                to_row -= row_clearance
+                                                    .get(*on_row)
+                                                    .copied()
+                                                    .unwrap_or(JJ_NODE_RADIUS);
                                             }
 
                                             let merge_start = point(
                                                 current_column + column_shift,
-                                                current_row - COMMIT_CIRCLE_RADIUS,
+                                                current_row - JJ_NODE_RADIUS,
                                             );
                                             let available_curve_width =
                                                 (to_column - merge_start.x).abs();
