@@ -25,6 +25,9 @@
 //! | `empty`                     | `○`   | lane accent at 40% opacity  |
 //! | default                     | `○`   | lane accent                 |
 //!
+//! Mutable commits are hollow rings, immutable ones filled diamonds —
+//! jj's filled-vs-hollow distinction.
+//!
 //! `@` and `~` are painted as real text glyphs (jj renders them as
 //! characters in the terminal); `◆`/`×`/`○` are vector shapes.
 //!
@@ -43,7 +46,7 @@ use gpui::{App, Pixels, Window, point, px};
 use theme::StatusColors;
 
 use crate::git_graph::{
-    COMMIT_CIRCLE_RADIUS, CommitLineSegment, CurveKind, LINE_WIDTH, draw_commit_circle,
+    COMMIT_CIRCLE_RADIUS, COMMIT_CIRCLE_STROKE_WIDTH, CommitLineSegment, CurveKind, LINE_WIDTH,
 };
 
 /// One row of the lane graph, aligned by index with the panel's `entries`.
@@ -551,7 +554,8 @@ fn paint_node_glyph(
 }
 
 /// Paints one commit node in jj's conventions: `○` normal (solid dot, the
-/// approved v2 base), `◆` immutable (filled diamond), `@` working copy and
+/// approved v2 base, hollow ring), `◆` immutable (filled diamond), `@`
+/// working copy and
 /// `~` hidden as real text glyphs, `×` conflict (crossed strokes).
 /// `empty` fades whatever glyph applies to 40% opacity.
 pub(crate) fn draw_jj_node(
@@ -567,8 +571,24 @@ pub(crate) fn draw_jj_node(
     let radius = COMMIT_CIRCLE_RADIUS;
 
     match glyph {
-        // Solid dot — the approved v2 base drawing.
-        JjNodeGlyph::Normal => draw_commit_circle(center_x, center_y, color, window),
+        // `○`: hollow ring — mutable commits are hollow, immutable (◆)
+        // filled, mirroring jj's filled-vs-hollow distinction.
+        JjNodeGlyph::Normal => {
+            let diameter = radius * 2.0;
+            let bounds = gpui::Bounds::new(
+                point(center_x - radius, center_y - radius),
+                gpui::Size {
+                    width: diameter,
+                    height: diameter,
+                },
+            );
+            window.paint_quad(
+                gpui::fill(bounds, gpui::transparent_black())
+                    .corner_radii(radius)
+                    .border_widths(COMMIT_CIRCLE_STROKE_WIDTH)
+                    .border_color(color),
+            );
+        }
         // `@`: the working copy, as jj's literal character.
         JjNodeGlyph::WorkingCopy => {
             paint_node_glyph("@", center_x, center_y, color, window, cx);
