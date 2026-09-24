@@ -1060,7 +1060,7 @@ impl Render for JjLog {
                                                                         ),
                                                                 )
                                                                 .into_any_element();
-                                                            vec![
+                                                            let cells = vec![
                                                                 description_cell,
                                                                 column_label(timestamp.into()),
                                                                 column_label(
@@ -1070,7 +1070,25 @@ impl Render for JjLog {
                                                                         .into(),
                                                                 ),
                                                                 column_label(change_short.into()),
-                                                            ]
+                                                            ];
+                                                            // Hidden commits read as
+                                                            // elided: the row is real
+                                                            // (jj renders full rows for
+                                                            // hidden commits named in the
+                                                            // revset) but faded like jj's
+                                                            // dimmed hidden text.
+                                                            if entry.flags.hidden {
+                                                                cells
+                                                                    .into_iter()
+                                                                    .map(|cell| {
+                                                                        div().opacity(0.4)
+                                                                            .child(cell)
+                                                                            .into_any_element()
+                                                                    })
+                                                                    .collect()
+                                                            } else {
+                                                                cells
+                                                            }
                                                         })
                                                         .collect()
                                                 },
