@@ -524,9 +524,12 @@ pub(crate) const JJ_NODE_STROKE_WIDTH: Pixels = px(2.5);
 /// cross them.
 pub(crate) const JJ_GLYPH_CLEARANCE: Pixels = px(6.5);
 
-/// Font size for the text-glyph nodes (`@`, `~`) — sized to read at the
-/// lane scale (the commit ring is 4.5px radius).
+/// Font size for the `@` glyph — sized to read at the lane scale (the
+/// commit ring is 4.5px radius).
 const NODE_GLYPH_FONT_SIZE: Pixels = px(13.0);
+/// The `~` glyph runs bigger and bolder than the `@`: a tilde is visually
+/// light for its em size, so it needs the head start to read as a node.
+const NODE_TILDE_FONT_SIZE: Pixels = px(16.0);
 
 /// Paints a single character centered on the node position, as jj's graph
 /// renders `@`/`~` in the terminal: real glyphs from Zed's bundled UI font.
@@ -534,6 +537,8 @@ const NODE_GLYPH_FONT_SIZE: Pixels = px(13.0);
 /// ascent+descent box inside it); the constant is tuned visually.
 fn paint_node_glyph(
     text: &str,
+    font_size: Pixels,
+    weight: gpui::FontWeight,
     center_x: Pixels,
     center_y: Pixels,
     color: gpui::Hsla,
@@ -543,7 +548,7 @@ fn paint_node_glyph(
     let run = gpui::TextRun {
         len: text.len(),
         font: gpui::Font {
-            weight: gpui::FontWeight::MEDIUM,
+            weight,
             ..gpui::font(".ZedSans")
         },
         color,
@@ -551,13 +556,10 @@ fn paint_node_glyph(
         underline: None,
         strikethrough: None,
     };
-    let line = window.text_system().shape_line(
-        text.to_string().into(),
-        NODE_GLYPH_FONT_SIZE,
-        &[run],
-        None,
-    );
-    let line_height = NODE_GLYPH_FONT_SIZE * 1.2;
+    let line = window
+        .text_system()
+        .shape_line(text.to_string().into(), font_size, &[run], None);
+    let line_height = font_size * 1.2;
     let origin = point(center_x - line.width() / 2.0, center_y - line_height / 2.0);
     line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx)
         .ok();
@@ -606,7 +608,16 @@ pub(crate) fn draw_jj_node(
         }
         // `@`: the working copy, as jj's literal character.
         JjNodeGlyph::WorkingCopy => {
-            paint_node_glyph("@", center_x, center_y, color, window, cx);
+            paint_node_glyph(
+                "@",
+                NODE_GLYPH_FONT_SIZE,
+                gpui::FontWeight::MEDIUM,
+                center_x,
+                center_y,
+                color,
+                window,
+                cx,
+            );
         }
         // `◆`: filled diamond.
         JjNodeGlyph::Immutable => {
@@ -621,9 +632,10 @@ pub(crate) fn draw_jj_node(
                 window.paint_path(path, color);
             }
         }
-        // `×`: two crossed strokes.
+        // `×`: two crossed strokes — arms stay inside the ring radius so
+        // the mark reads compact next to the circles.
         JjNodeGlyph::Conflict => {
-            let r = radius * 1.1;
+            let r = radius * 0.75;
             let mut builder = gpui::PathBuilder::stroke(LINE_WIDTH);
             builder.move_to(point(center_x - r, center_y - r));
             builder.line_to(point(center_x + r, center_y + r));
@@ -636,7 +648,16 @@ pub(crate) fn draw_jj_node(
         }
         // `~`: hidden, as jj's elision character.
         JjNodeGlyph::Hidden => {
-            paint_node_glyph("~", center_x, center_y, color, window, cx);
+            paint_node_glyph(
+                "~",
+                NODE_TILDE_FONT_SIZE,
+                gpui::FontWeight::BOLD,
+                center_x,
+                center_y,
+                color,
+                window,
+                cx,
+            );
         }
     }
 }
