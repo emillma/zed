@@ -343,6 +343,11 @@ pub(crate) struct JjGraphData {
     /// overlaps sibling edges in one column instead of detouring out to a
     /// fresh lane). Resolved when the shared parent is reached.
     piggyback_edges: HashMap<String, SmallVec<[PiggybackEdge; 1]>>,
+    /// Extra-parent edges whose parent is outside the window, collapsed
+    /// into the primary's elided landing column (jj draws one line through
+    /// an elided node, not one lane per missing parent). Resolved when the
+    /// elided row is laid out.
+    elided_piggybacks: Vec<PiggybackEdge>,
     /// The widest the lane area ever got while laying out the window.
     pub(crate) max_lanes: usize,
 }
@@ -355,6 +360,7 @@ impl JjGraphData {
             parent_to_lanes: HashMap::default(),
             elided_landings: SmallVec::default(),
             piggyback_edges: HashMap::default(),
+            elided_piggybacks: Vec::default(),
             next_color: 0,
             accent_colors_count,
             commits: Vec::with_capacity(entries.len()),
@@ -453,6 +459,36 @@ impl JjGraphData {
                             });
                         }
                     }
+                }
+
+                // The collapsed missing-parent extras converge into the ~
+                // at the primary's column, in the shared lane's color.
+                for pig in std::mem::take(&mut self.elided_piggybacks) {
+                    let color_idx = self.get_lane_color(pig.column) as usize;
+                    self.lines.push(Rc::new(JjCommitLine {
+                        #[cfg(test)]
+                        child: pig.child.clone(),
+                        #[cfg(test)]
+                        parent: pig.parent.clone(),
+                        child_column: pig.child_col,
+                        full_interval: pig.child_row..commit_row,
+                        color_idx,
+                        segments: smallvec::smallvec![CommitLineSegment::Straight {
+                            to_row: usize::MAX
+                        }],
+                    }));
+                    self.edges.push(EdgeLayout {
+                        #[cfg(test)]
+                        child: pig.child.clone(),
+                        #[cfg(test)]
+                        parent: pig.parent.clone(),
+                        child_row: pig.child_row,
+                        parent_row: commit_row,
+                        column: pig.column,
+                        child_col: pig.child_col,
+                        parent_col: glyph_lane.unwrap_or(pig.column),
+                        color_idx,
+                    });
                 }
             }
 
@@ -616,6 +652,22 @@ impl JjGraphData {
                             // (or in `finish()` if it does not).
                             self.elided_landings.push(commit_lane);
                         }
+                    } else if !emitted.contains(parent.as_str()) && !self.elided_landings.is_empty()
+                    {
+                        // jj collapses multiple missing-parent edges into the
+                        // single elided landing: run this edge in the
+                        // primary's landing column instead of sprawling a
+                        // fresh lane per missing parent.
+                        let column = *self.elided_landings.last().unwrap();
+                        self.elided_piggybacks.push(PiggybackEdge {
+                            #[cfg(test)]
+                            child: commit_id.clone(),
+                            #[cfg(test)]
+                            parent: parent.clone(),
+                            child_row: commit_row,
+                            child_col: commit_lane,
+                            column,
+                        });
                     } else if emitted.contains(parent.as_str())
                         && self
                             .parent_to_lanes
@@ -823,7 +875,7 @@ pub(crate) const JJ_GLYPH_CLEARANCE: Pixels = px(6.5);
 /// Rendered box sizes for the SVG node marks — tuned so the ink clears
 /// the lane lines (the commit ring is 4.5px radius).
 const AT_SIGN_SIZE: Pixels = px(13.0);
-const WAVE_SIZE: Pixels = px(12.0);
+const WAVE_SIZE: Pixels = px(10.0);
 const CONFLICT_X_SIZE: Pixels = px(10.0);
 
 /// Node marks as monochrome SVGs, tinted with the node color at paint
@@ -1171,12 +1223,15 @@ mod tests {
         let graph = JjGraphData::from_entries(&entries, 8);
         assert_eq!(graph.commits.len(), 6);
         assert_eq!(lanes(&graph), vec![0, 0, 0, 0, 0, 0]);
-        assert_eq!(graph.max_lanes, 2);
+        // The missing extra collapses into the primary's landing column —
+        // one line through the ~, no lane sprawl.
+        assert_eq!(graph.max_lanes, 1);
         assert_eq!(graph.edges.len(), 4);
         assert_eq!(graph.lines.len(), graph.edges.len());
         assert_eq!(full(edge(&graph, "h1", "x")), (0, 1, 0, 0, 0, 0));
-        // The extra branch converges into the ~ at the primary's column.
-        assert_eq!(full(edge(&graph, "h1", "y")), (0, 1, 1, 0, 0, 0));
+        // The extra branch overlaps the primary's column and converges into
+        // the ~ at the same column.
+        assert_eq!(full(edge(&graph, "h1", "y")), (0, 1, 0, 0, 0, 0));
         assert_eq!(full(edge(&graph, "h2", "x")), (2, 3, 0, 0, 0, 0));
         assert_eq!(full(edge(&graph, "h3", "y")), (4, 5, 0, 0, 0, 0));
     }
@@ -1393,6 +1448,29 @@ mod tests {
         assert_eq!(full(edge(&graph, "c2", "b")), (2, 3, 2, 3, 1, 1));
         assert_eq!(full(edge(&graph, "c1", "b")), (1, 3, 2, 2, 1, 1));
         assert_eq!(full(edge(&graph, "m", "b")), (0, 3, 1, 0, 1, 3));
+    }
+
+    #[test]
+    fn missing_extra_parents_share_the_elided_landing() {
+        // An octopus whose primary AND extra parents are all outside the
+        // window: one elided landing, and the extras collapse into the
+        // primary's column (jj draws one line through the ~) — no fresh
+        // lane per missing parent.
+        let entries = vec![
+            entry("m", &["o1", "o2", "o3"]),
+            elided_row("el-m"),
+            entry("root", &[]),
+        ];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        assert_eq!(lanes(&graph), vec![0, 0, 0]);
+        assert_eq!(graph.max_lanes, 1, "no lane sprawl for missing parents");
+        assert_eq!(graph.edges.len(), 3);
+        assert_eq!(graph.lines.len(), graph.edges.len());
+        assert_eq!(full(edge(&graph, "m", "o1")), (0, 1, 0, 0, 0, 0));
+        // The collapsed extras overlap the primary's column and converge
+        // into the ~ at the same column.
+        assert_eq!(full(edge(&graph, "m", "o2")), (0, 1, 0, 0, 0, 0));
+        assert_eq!(full(edge(&graph, "m", "o3")), (0, 1, 0, 0, 0, 0));
     }
 
     #[test]
