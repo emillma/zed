@@ -800,10 +800,12 @@ impl JjLog {
                     // Nodes paint on top of the edges: a background-colored
                     // halo behind each glyph gives it a bit of space and
                     // masks the stub ends that run into it.
+                    // The @ keeps the wider halo (its ink is broad); the ~
+                    // only ever receives edges from directly above or below,
+                    // so its halo matches the circles' — the wave's
+                    // horizontal overhang may stick out.
                     let halo_radius = |glyph: JjNodeGlyph| match glyph {
-                        JjNodeGlyph::WorkingCopy | JjNodeGlyph::Hidden => {
-                            JJ_GLYPH_CLEARANCE + EDGE_BORDER_WIDTH
-                        }
+                        JjNodeGlyph::WorkingCopy => JJ_GLYPH_CLEARANCE + EDGE_BORDER_WIDTH,
                         _ => JJ_NODE_RADIUS + EDGE_BORDER_WIDTH,
                     };
                     for (row_idx, (row, flags)) in
