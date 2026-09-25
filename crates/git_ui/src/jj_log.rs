@@ -65,10 +65,13 @@ const EDGE_BORDER_WIDTH: Pixels = px(1.0);
 /// `JJ_NODE_RADIUS + EDGE_BORDER_WIDTH` (5.5px), written out because
 /// `Pixels`' derived `Add` is not `const`.
 const JJ_EDGE_CLEARANCE: Pixels = px(5.5);
-/// y-offset of the child-row stub from the child node center.
-const B_STUB_OFFSET: Pixels = JJ_EDGE_CLEARANCE;
-/// y-offset of the parent-row stub from the parent node center.
-const T_STUB_OFFSET: Pixels = JJ_EDGE_CLEARANCE;
+/// y-offset of the stubs from their node centers. The bottom stub attaches
+/// BELOW the child node (the edge exits through the node's bottom) and the
+/// top stub ABOVE the parent node (it enters through the node's top) — the
+/// natural flow direction. The small offset keeps a node's incoming and
+/// outgoing stubs close together; the node's background halo (painted over
+/// the edges) masks the junction.
+const EDGE_STUB_OFFSET: Pixels = px(2.0);
 /// Edges whose vertical column reaches this far right are elided (the graph
 /// is too wide to draw them); their nodes still render.
 const MAX_EDGE_COLUMN: usize = 64;
@@ -101,6 +104,11 @@ impl LaneEdge {
     fn line_to(&mut self, to: Point<Pixels>) {
         self.border.line_to(to);
         self.fill.line_to(to);
+    }
+
+    fn curve_to(&mut self, to: Point<Pixels>, ctrl: Point<Pixels>) {
+        self.border.curve_to(to, ctrl);
+        self.fill.curve_to(to, ctrl);
     }
 }
 
@@ -676,55 +684,34 @@ impl JjLog {
                     let mut parts: Vec<EdgePart> = Vec::new();
 
                     let status_colors = NodeStatusColors::from_theme(cx.theme().status());
-                    for (row_idx, (row, flags)) in
-                        rows.into_iter().zip(visible_flags.iter()).enumerate()
-                    {
-                        let lane_color = accent_colors.color_for_index(row.color_idx as u32);
-                        let row_y_center =
-                            bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
-                                - vertical_scroll_offset;
-
-                        let commit_x = lane_center_x(bounds, row.lane as f32);
-
-                        let glyph = elided_glyph(flags);
-                        let color = node_color(glyph, lane_color, &status_colors);
-                        draw_jj_node(glyph, flags, commit_x, row_y_center, color, window, cx);
-                    }
-
-                    // Each edge: up to three parts — the bottom
-                    // stub at the child row, the vertical in `column`, the
-                    // top stub at the parent row. Zero-length parts are
-                    // skipped; stubs start a glyph clearance from the node
-                    // center so borders never cut a glyph.
+                    // Each edge: up to three parts — the bottom stub (with
+                    // its bend curve) at the child row, the vertical in
+                    // `column`, the top stub (with its bend curve) at the
+                    // parent row. Stubs attach below the child node and
+                    // above the parent node (the natural flow direction),
+                    // hug the nodes, and run to the node centers: the nodes paint on top
+                    // with background halos, so nothing needs to be split or inset around
+                    // a glyph anymore.
                     for edge in &edge_geoms {
                         let col_x = lane_center_x(bounds, edge.column as f32);
                         let child_x = lane_center_x(bounds, edge.child_col as f32);
                         let parent_x = lane_center_x(bounds, edge.parent_col as f32);
-                        // Stub ys sit a row clearance from the node center:
-                        // text glyphs (`@`, `~`) need the wider per-row
-                        // clearance the old builder already used.
-                        let b_y = row_y(edge.child_row)
-                            - row_clearance
-                                .get(edge.child_row)
-                                .copied()
-                                .unwrap_or(B_STUB_OFFSET);
-                        let t_y = row_y(edge.parent_row)
-                            + row_clearance
-                                .get(edge.parent_row)
-                                .copied()
-                                .unwrap_or(T_STUB_OFFSET);
+                        let b_y = row_y(edge.child_row) + EDGE_STUB_OFFSET;
+                        let t_y = row_y(edge.parent_row) - EDGE_STUB_OFFSET;
 
                         let reach = edge.reach();
+                        // Rounded bend radius, as the old per-lane renderer
+                        // used: a third of a row, capped at half the vertical
+                        // span so both bends always fit.
+                        let curve_r = (row_height / 3.0).min((t_y - b_y) / 2.0).max(px(0.0));
 
                         if child_x != col_x {
-                            let (stub_start, stub_end) = if child_x < col_x {
-                                (child_x + JJ_EDGE_CLEARANCE, col_x)
-                            } else {
-                                (col_x, child_x - JJ_EDGE_CLEARANCE)
-                            };
+                            let dir = (col_x - child_x).signum();
+                            let bend_x = col_x - dir * curve_r;
                             let mut lane = LaneEdge::new();
-                            lane.move_to(point(stub_start, b_y));
-                            lane.line_to(point(stub_end, b_y));
+                            lane.move_to(point(child_x, b_y));
+                            lane.line_to(point(bend_x, b_y));
+                            lane.curve_to(point(col_x, b_y + curve_r), point(col_x, b_y));
                             parts.push(EdgePart {
                                 layer: LAYER_BT,
                                 sort_key: reach,
@@ -733,10 +720,22 @@ impl JjLog {
                             });
                         }
 
-                        if b_y != t_y {
+                        // The vertical overlaps its bends by half a pixel:
+                        // abutting butt caps leave an anti-aliasing seam.
+                        let v_start = if child_x != col_x {
+                            b_y + curve_r - px(0.5)
+                        } else {
+                            b_y
+                        };
+                        let v_end = if parent_x != col_x {
+                            t_y - curve_r + px(0.5)
+                        } else {
+                            t_y
+                        };
+                        if v_start != v_end {
                             let mut lane = LaneEdge::new();
-                            lane.move_to(point(col_x, b_y));
-                            lane.line_to(point(col_x, t_y));
+                            lane.move_to(point(col_x, v_start));
+                            lane.line_to(point(col_x, v_end));
                             parts.push(EdgePart {
                                 layer: LAYER_V,
                                 sort_key: edge.column,
@@ -746,14 +745,12 @@ impl JjLog {
                         }
 
                         if parent_x != col_x {
-                            let (stub_start, stub_end) = if col_x < parent_x {
-                                (col_x, parent_x - JJ_EDGE_CLEARANCE)
-                            } else {
-                                (parent_x + JJ_EDGE_CLEARANCE, col_x)
-                            };
+                            let dir = (parent_x - col_x).signum();
+                            let bend_x = col_x + dir * curve_r;
                             let mut lane = LaneEdge::new();
-                            lane.move_to(point(stub_start, t_y));
-                            lane.line_to(point(stub_end, t_y));
+                            lane.move_to(point(col_x, t_y - curve_r));
+                            lane.curve_to(point(bend_x, t_y), point(col_x, t_y));
+                            lane.line_to(point(parent_x, t_y));
                             parts.push(EdgePart {
                                 layer: LAYER_BT,
                                 sort_key: reach,
@@ -781,6 +778,60 @@ impl JjLog {
                             window.paint_path(border, border_color);
                             window.paint_path(fill, line_color);
                         }
+                    }
+
+                    // Nodes paint on top of the edges: a background-colored
+                    // halo behind each glyph gives it a bit of space and
+                    // masks the stub ends that run into it.
+                    let halo_radius = |glyph: JjNodeGlyph| match glyph {
+                        JjNodeGlyph::WorkingCopy | JjNodeGlyph::Hidden => {
+                            JJ_GLYPH_CLEARANCE + EDGE_BORDER_WIDTH
+                        }
+                        _ => JJ_NODE_RADIUS + EDGE_BORDER_WIDTH,
+                    };
+                    for (row_idx, (row, flags)) in
+                        rows.into_iter().zip(visible_flags.iter()).enumerate()
+                    {
+                        let lane_color = accent_colors.color_for_index(row.color_idx as u32);
+                        let row_y_center =
+                            bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
+                                - vertical_scroll_offset;
+
+                        let commit_x = lane_center_x(bounds, row.lane as f32);
+
+                        let glyph = elided_glyph(flags);
+                        let color = node_color(glyph, lane_color, &status_colors);
+                        let halo = halo_radius(glyph);
+                        // A private layer per node: gpui batches primitives
+                        // by type within a layer (quads and paths draw in
+                        // separate passes), so paint order alone doesn't put
+                        // the quads/sprites above the edge paths — a layer
+                        // per node does.
+                        let pad = px(2.0);
+                        let node_bounds = gpui::Bounds::new(
+                            point(commit_x - halo - pad, row_y_center - halo - pad),
+                            gpui::Size {
+                                width: (halo + pad) * 2.0,
+                                height: (halo + pad) * 2.0,
+                            },
+                        );
+                        window.paint_layer(node_bounds, |window| {
+                            let diameter = halo * 2.0;
+                            window.paint_quad(
+                                gpui::fill(
+                                    gpui::Bounds::new(
+                                        point(commit_x - halo, row_y_center - halo),
+                                        gpui::Size {
+                                            width: diameter,
+                                            height: diameter,
+                                        },
+                                    ),
+                                    border_color,
+                                )
+                                .corner_radii(halo),
+                            );
+                            draw_jj_node(glyph, flags, commit_x, row_y_center, color, window, cx);
+                        });
                     }
                 })
             },
@@ -1712,7 +1763,7 @@ mod tests {
             .filter(|line| !line.is_empty())
             .collect();
 
-        let grouped = topo_group_entries(entries);
+        let grouped = topo_group_entries(entries.clone());
         let actual: Vec<String> = grouped
             .iter()
             .map(|entry| entry.change_id.to_string().chars().take(12).collect())
@@ -1721,6 +1772,30 @@ mod tests {
             actual, expected,
             "topo-grouped row order must match jj log's rendering order"
         );
+
+        // Detour diagnostic: an edge whose child and parent sit in the same
+        // column but whose vertical runs in a different one makes an
+        // unnecessary right-hand detour. Print any offenders with context.
+        let rows = synthesize_elided_entries(topo_group_entries(entries));
+        let graph = JjGraphData::from_entries(&rows, 8);
+        for (idx, edge) in graph.edges.iter().enumerate() {
+            let lo = edge.child_col.min(edge.parent_col);
+            let hi = edge.child_col.max(edge.parent_col);
+            if edge.column > hi || edge.column < lo {
+                let child = rows
+                    .get(edge.child_row)
+                    .map(|e| format!("{} '{}'", e.change_id, e.description))
+                    .unwrap_or_default();
+                let parent = rows
+                    .get(edge.parent_row)
+                    .map(|e| format!("{} '{}'", e.change_id, e.description))
+                    .unwrap_or_default();
+                eprintln!(
+                    "detour edge #{idx}: child {child} (row {}, col {}) -> parent {parent} (row {}, col {}), column {}",
+                    edge.child_row, edge.child_col, edge.parent_row, edge.parent_col, edge.column
+                );
+            }
+        }
     }
 
     fn test_entry(change_id: &str, parents: &[&str]) -> JjLogEntry {

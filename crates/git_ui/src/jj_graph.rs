@@ -106,6 +106,20 @@ pub(crate) struct EdgeLayout {
     pub(crate) color_idx: usize,
 }
 
+/// An extra-parent edge that shares a sibling's already-pending lane instead
+/// of allocating its own (jj overlaps sibling edges in one column). Resolved
+/// into an [`EdgeLayout`] when the shared parent is reached.
+#[derive(Debug)]
+struct PiggybackEdge {
+    #[cfg(test)]
+    child: String,
+    #[cfg(test)]
+    parent: String,
+    child_row: usize,
+    child_col: usize,
+    column: usize,
+}
+
 impl JjCommitLine {
     /// Mirrors GitGraph's `CommitLine::get_first_visible_segment_idx`.
     pub(crate) fn get_first_visible_segment_idx(
@@ -325,6 +339,10 @@ pub(crate) struct JjGraphData {
     /// for the elided row the data layer inserts after their child; an
     /// elided row resolves them all at its own row index.
     elided_landings: SmallVec<[usize; 2]>,
+    /// Extra-parent edges sharing a sibling's already-pending lane (jj
+    /// overlaps sibling edges in one column instead of detouring out to a
+    /// fresh lane). Resolved when the shared parent is reached.
+    piggyback_edges: HashMap<String, SmallVec<[PiggybackEdge; 1]>>,
     /// The widest the lane area ever got while laying out the window.
     pub(crate) max_lanes: usize,
 }
@@ -336,6 +354,7 @@ impl JjGraphData {
             lane_colors: HashMap::default(),
             parent_to_lanes: HashMap::default(),
             elided_landings: SmallVec::default(),
+            piggyback_edges: HashMap::default(),
             next_color: 0,
             accent_colors_count,
             commits: Vec::with_capacity(entries.len()),
@@ -513,6 +532,37 @@ impl JjGraphData {
                         }
                     }
                 }
+
+                // Extra-parent edges that piggybacked on a sibling's pending
+                // lane resolve here. They take the shared lane's color so the
+                // overlap renders as one continuous line.
+                for pig in self.piggyback_edges.remove(&commit_id).unwrap_or_default() {
+                    let color_idx = self.get_lane_color(pig.column) as usize;
+                    self.lines.push(Rc::new(JjCommitLine {
+                        #[cfg(test)]
+                        child: pig.child.clone(),
+                        #[cfg(test)]
+                        parent: pig.parent.clone(),
+                        child_column: pig.child_col,
+                        full_interval: pig.child_row..commit_row,
+                        color_idx,
+                        segments: smallvec::smallvec![CommitLineSegment::Straight {
+                            to_row: usize::MAX
+                        }],
+                    }));
+                    self.edges.push(EdgeLayout {
+                        #[cfg(test)]
+                        child: pig.child.clone(),
+                        #[cfg(test)]
+                        parent: pig.parent.clone(),
+                        child_row: pig.child_row,
+                        parent_row: commit_row,
+                        column: pig.column,
+                        child_col: pig.child_col,
+                        parent_col: commit_lane,
+                        color_idx,
+                    });
+                }
             }
 
             // Elided rows have no outgoing edges: they exist to be landed
@@ -558,6 +608,35 @@ impl JjGraphData {
                             // (or in `finish()` if it does not).
                             self.elided_landings.push(commit_lane);
                         }
+                    } else if emitted.contains(parent.as_str())
+                        && self
+                            .parent_to_lanes
+                            .get(parent.as_str())
+                            .is_some_and(|lanes| !lanes.is_empty())
+                    {
+                        // jj-style lane sharing: another child's edge to this
+                        // parent is already pending; run this edge in the
+                        // sibling's column — the two overlap between the
+                        // siblings' rows and converge at the parent — instead
+                        // of detouring out to a fresh lane beyond both
+                        // endpoints.
+                        let shared = self.parent_to_lanes[parent.as_str()]
+                            .iter()
+                            .copied()
+                            .min_by_key(|lane| lane.abs_diff(commit_lane))
+                            .unwrap();
+                        self.piggyback_edges
+                            .entry(parent.clone())
+                            .or_default()
+                            .push(PiggybackEdge {
+                                #[cfg(test)]
+                                child: commit_id.clone(),
+                                #[cfg(test)]
+                                parent: parent.clone(),
+                                child_row: commit_row,
+                                child_col: commit_lane,
+                                column: shared,
+                            });
                     } else {
                         let new_lane = self.first_empty_lane_idx();
 
@@ -853,13 +932,18 @@ pub(crate) fn draw_jj_node(
         // `×`: two crossed strokes — arms stay inside the ring radius so
         // the mark reads compact next to the circles.
         JjNodeGlyph::Conflict => {
-            let r = radius * 0.65;
-            let mut builder = round_stroke_builder(LINE_WIDTH);
+            // Thin butt-capped arms: round caps at this width bulge past the
+            // arm ends and read as spill.
+            let r = radius * 0.75;
+            let mut builder = gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
+                gpui::StrokeOptions::default()
+                    .with_line_width(f32::from(LINE_WIDTH) * 0.7)
+                    .with_line_cap(LineCap::Butt),
+            ));
             builder.move_to(point(center_x - r, center_y - r));
             builder.line_to(point(center_x + r, center_y + r));
             builder.move_to(point(center_x - r, center_y + r));
             builder.line_to(point(center_x + r, center_y - r));
-            builder.close();
             if let Ok(path) = builder.build() {
                 window.paint_path(path, color);
             }
@@ -1239,6 +1323,32 @@ mod tests {
         assert_eq!(full(edge(&graph, "p3", "a")), (2, 4, 1, 1, 1, 1));
         assert_eq!(full(edge(&graph, "p2", "a")), (3, 4, 2, 2, 1, 2));
         assert_eq!(graph.lines.len(), graph.edges.len());
+    }
+
+    #[test]
+    fn extra_parent_shares_sibling_lane() {
+        // c2's extra parent b already has a pending edge (from c1): the new
+        // edge piggybacks in that lane instead of detouring out to a fresh
+        // one beyond both endpoints — the two overlap between the siblings'
+        // rows and converge at b.
+        let entries = vec![
+            entry("m", &["a", "b"]),
+            entry("c1", &["b"]),
+            entry("c2", &["a", "b"]),
+            entry("b", &["x"]),
+            entry("a", &[]),
+            entry("x", &[]),
+        ];
+        let graph = JjGraphData::from_entries(&entries, 8);
+        // x continues b's lane (min-incoming), hence the trailing 1.
+        assert_eq!(lanes(&graph), vec![0, 2, 3, 1, 0, 1]);
+        assert_eq!(graph.edges.len(), graph.lines.len());
+        // The piggyback edge runs between its endpoints (col 3 -> col 1 via
+        // the sibling's lane 2) and takes the shared lane's color, so the
+        // overlap with c1's edge reads as one continuous line.
+        assert_eq!(full(edge(&graph, "c2", "b")), (2, 3, 2, 3, 1, 1));
+        assert_eq!(full(edge(&graph, "c1", "b")), (1, 3, 2, 2, 1, 1));
+        assert_eq!(full(edge(&graph, "m", "b")), (0, 3, 1, 0, 1, 3));
     }
 
     #[test]
