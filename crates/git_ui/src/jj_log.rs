@@ -2,8 +2,8 @@ use crate::git_graph::{
     LANE_WIDTH, LEFT_PADDING, LINE_WIDTH, accent_colors_count, lane_center_x, timestamp_format,
 };
 use crate::jj_graph::{
-    JJ_GLYPH_CLEARANCE, JJ_NODE_RADIUS, JjGraphData, JjNodeGlyph, NodeStatusColors, draw_jj_node,
-    node_color, node_glyph,
+    JJ_GLYPH_CLEARANCE, JJ_NODE_RADIUS, JjGraphData, JjNodeGlyph, NodeStatusColors,
+    append_fill_circle, draw_jj_node, node_color, node_glyph,
 };
 use crate::jj_settings::JjSettings;
 use anyhow::Result;
@@ -12,7 +12,8 @@ use git::jj::{JjLogEntry, JjLogFlags};
 use gpui::{
     Anchor, AnyElement, App, Bounds, Context, DefiniteLength, DismissEvent, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, Render,
-    SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, deferred, point, px,
+    ScrollWheelEvent, SharedString, Subscription, Task, WeakEntity, Window, actions, anchored,
+    deferred, point, px,
 };
 use menu::Confirm;
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
@@ -21,8 +22,8 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
     Chip, ColumnWidthConfig, ContextMenu, ContextMenuEntry, DocumentationSide, HeaderResizeInfo,
-    IconButtonShape, RedistributableColumnsState, Table, TableInteractionState, TableRenderContext,
-    TableResizeBehavior, Tooltip, bind_redistributable_columns, prelude::*,
+    IconButtonShape, RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
+    TableRenderContext, TableResizeBehavior, Tooltip, bind_redistributable_columns, prelude::*,
     redistribute_hidden_fractions, redistribute_hidden_widths,
     render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
 };
@@ -586,6 +587,34 @@ impl JjLog {
         self.set_context_menu(context_menu, position, window, cx);
     }
 
+    /// A wheel event over the graph canvas: the canvas is a sibling of the
+    /// table in the h_flex, so the event never reaches the table's own scroll
+    /// handler. Forward it to the table's scroll state manually — mirroring
+    /// GitGraph's `handle_graph_scroll`.
+    fn handle_graph_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let line_height = window.line_height();
+        let delta = event.delta.pixel_delta(line_height);
+
+        let table_state = self.table_interaction_state.read(cx);
+        let current_offset = table_state.scroll_offset();
+        let viewport_height = table_state.scroll_handle.viewport().size.height;
+        let content_height = Self::row_height(window, cx) * self.entries.len();
+        let max_vertical_scroll = (viewport_height - content_height).min(px(0.));
+
+        let new_y = (current_offset.y + delta.y).clamp(max_vertical_scroll, px(0.));
+        let new_offset = Point::new(current_offset.x, new_y);
+
+        if new_offset != current_offset {
+            table_state.set_scroll_offset(new_offset);
+            cx.notify();
+        }
+    }
+
     /// Paints the lane graph over the table's visible rows, synced to the
     /// table's scroll state exactly like GitGraph: rows and lanes are shifted
     /// table's scroll offset and only the visible range is painted.
@@ -696,8 +725,22 @@ impl JjLog {
                         let col_x = lane_center_x(bounds, edge.column as f32);
                         let child_x = lane_center_x(bounds, edge.child_col as f32);
                         let parent_x = lane_center_x(bounds, edge.parent_col as f32);
-                        let b_y = row_y(edge.child_row) + EDGE_STUB_OFFSET;
-                        let t_y = row_y(edge.parent_row) - EDGE_STUB_OFFSET;
+                        // Stubs are tangential to the node's halo from the
+                        // inside: the line's outer edge touches the halo
+                        // circle (offset = halo radius − half line width).
+                        let line_half = LINE_WIDTH / 2.0;
+                        let b_y = row_y(edge.child_row)
+                            + row_clearance
+                                .get(edge.child_row)
+                                .copied()
+                                .unwrap_or(EDGE_STUB_OFFSET)
+                            - line_half;
+                        let t_y = row_y(edge.parent_row)
+                            - row_clearance
+                                .get(edge.parent_row)
+                                .copied()
+                                .unwrap_or(EDGE_STUB_OFFSET)
+                            + line_half;
 
                         let reach = edge.reach();
                         // Rounded bend radius, as the old per-lane renderer
@@ -805,8 +848,10 @@ impl JjLog {
                         // A private layer per node: gpui batches primitives
                         // by type within a layer (quads and paths draw in
                         // separate passes), so paint order alone doesn't put
-                        // the quads/sprites above the edge paths — a layer
-                        // per node does.
+                        // the glyphs above the edge paths — a layer per node
+                        // does. The halo is a path circle (not a quad) so it
+                        // centers exactly on the glyph — quads snap their
+                        // bounds to the device grid and sat off-center.
                         let pad = px(2.0);
                         let node_bounds = gpui::Bounds::new(
                             point(commit_x - halo - pad, row_y_center - halo - pad),
@@ -816,20 +861,15 @@ impl JjLog {
                             },
                         );
                         window.paint_layer(node_bounds, |window| {
-                            let diameter = halo * 2.0;
-                            window.paint_quad(
-                                gpui::fill(
-                                    gpui::Bounds::new(
-                                        point(commit_x - halo, row_y_center - halo),
-                                        gpui::Size {
-                                            width: diameter,
-                                            height: diameter,
-                                        },
-                                    ),
-                                    border_color,
-                                )
-                                .corner_radii(halo),
+                            let mut halo_builder = gpui::PathBuilder::fill();
+                            append_fill_circle(
+                                &mut halo_builder,
+                                point(commit_x, row_y_center),
+                                halo,
                             );
+                            if let Ok(path) = halo_builder.build() {
+                                window.paint_path(path, border_color);
+                            }
                             draw_jj_node(glyph, flags, commit_x, row_y_center, color, window, cx);
                         });
                     }
@@ -1323,6 +1363,7 @@ impl Render for JjLog {
                                         .h_full()
                                         .min_w_0()
                                         .overflow_hidden()
+                                        .on_scroll_wheel(cx.listener(Self::handle_graph_scroll))
                                         .child(div().size_full().child(self.render_graph_canvas(
                                             graph_data,
                                             row_height,

@@ -48,7 +48,7 @@ use std::{
 use smallvec::SmallVec;
 
 use git::jj::{JjLogEntry, JjLogFlags};
-use gpui::{App, PathStyle, Pixels, SharedString, TransformationMatrix, Window, point, px};
+use gpui::{App, PathStyle, Pixels, Point, SharedString, Window, point, px};
 use lyon::tessellation::{LineCap, LineJoin};
 use theme::StatusColors;
 
@@ -405,15 +405,21 @@ impl JjGraphData {
             let commit_id = entry.change_id.to_string();
 
             // An elided row lands the edges pending from above: lanes whose
-            // parent is outside the window terminate here, with a
-            // zero-length bottom stub (`parent_col` = the edge's own
-            // column, so the vertical runs straight into the `~`), and the
-            // row takes the last such lane for its glyph.
+            // parent is outside the window terminate here. jj puts the `~`
+            // at the primary edge's column (the first landing) and the other
+            // branches' edges converge into it, so a multi-branch elision
+            // reads as one node instead of a floating glyph on the right.
             let mut landing_lane: Option<usize> = None;
             if entry.flags.elided {
                 let landings = std::mem::take(&mut self.elided_landings);
-                for lane in landings {
-                    landing_lane = Some(lane);
+                let glyph_lane = landings.first().copied();
+                landing_lane = glyph_lane;
+                for (landing_idx, lane) in landings.iter().copied().enumerate() {
+                    let parent_col = if landing_idx == 0 {
+                        lane
+                    } else {
+                        glyph_lane.unwrap_or(lane)
+                    };
                     let color = self.lane_colors.get(&lane).copied().unwrap_or(0);
                     let state = &mut self.lane_states[lane];
                     let edge_source = match state {
@@ -426,7 +432,8 @@ impl JjGraphData {
                         } => Some((child.clone(), parent.clone(), *starting_row, *starting_col)),
                         JjLaneState::Empty => None,
                     };
-                    if let Some(commit_line) = state.to_commit_lines(commit_row, lane, lane, color)
+                    if let Some(commit_line) =
+                        state.to_commit_lines(commit_row, lane, parent_col, color)
                     {
                         let color_idx = commit_line.color_idx;
                         self.lines.push(Rc::new(commit_line));
@@ -441,7 +448,7 @@ impl JjGraphData {
                                 parent_row: commit_row,
                                 column: lane,
                                 child_col,
-                                parent_col: lane,
+                                parent_col,
                                 color_idx,
                             });
                         }
@@ -456,7 +463,8 @@ impl JjGraphData {
 
             let commit_lane = commit_lane
                 // An elided row with no incoming edge sits in the column
-                // where its edge lands (the `~` is the edge's terminus).
+                // where its primary edge lands (the `~` is that edge's
+                // terminus; the other branches converge into it).
                 .or(landing_lane.filter(|_| entry.flags.elided))
                 .unwrap_or_else(|| self.first_empty_lane_idx());
 
@@ -816,8 +824,6 @@ const WAVE_SIZE: Pixels = px(12.0);
 /// Node marks as monochrome SVGs, tinted with the node color at paint
 /// time. The `@` is Lucide's at-sign (ISC); the wave is hand-drawn to read
 /// as jj's elision mark at node scale.
-const AT_SIGN_SVG: &str = include_str!("../assets/jj_at_sign.svg");
-const WAVE_SVG: &str = include_str!("../assets/jj_wave.svg");
 
 /// A stroke path builder with round caps and joins — the node marks read
 /// softer than lyon's default butt caps.
@@ -830,38 +836,68 @@ fn round_stroke_builder(width: Pixels) -> gpui::PathBuilder {
     ))
 }
 
-/// Paints a monochrome node SVG centered on the node position, tinted with
-/// the node color.
-fn paint_node_svg(
-    svg: &'static str,
-    name: &'static str,
-    size: Pixels,
-    center_x: Pixels,
-    center_y: Pixels,
-    color: gpui::Hsla,
-    window: &mut Window,
-    cx: &mut App,
+/// Appends a circular arc (centered `center`, radius `r`) from `start_deg` to
+/// `end_deg` — degrees in y-down screen coordinates — to the builder, which
+/// must already be positioned at the arc's start point. Approximated with
+/// quadratic beziers of at most 45° each (gpui's `curve_to` is quadratic).
+pub(crate) fn append_arc(
+    builder: &mut gpui::PathBuilder,
+    center: Point<Pixels>,
+    r: Pixels,
+    start_deg: f32,
+    end_deg: f32,
 ) {
-    let half = size / 2.0;
-    let bounds = gpui::Bounds::new(
-        point(center_x - half, center_y - half),
-        gpui::Size {
-            width: size,
-            height: size,
-        },
-    );
-    window
-        .paint_svg(
-            bounds,
-            SharedString::from(name),
-            Some(svg.as_bytes()),
-            TransformationMatrix::unit(),
-            color,
-            cx,
-        )
-        .ok();
+    let sweep = end_deg - start_deg;
+    let segments = ((sweep.abs() / 45.0).ceil() as usize).max(1);
+    let step = sweep / segments as f32;
+    let tangent_len = r * (step.to_radians() / 2.0).tan();
+    let dir = if step > 0.0 { 1.0 } else { -1.0 };
+    let point_at = |deg: f32| -> Point<Pixels> {
+        let (s, c) = deg.to_radians().sin_cos();
+        point(center.x + r * c, center.y + r * s)
+    };
+    let mut prev = start_deg;
+    for _ in 0..segments {
+        let next = prev + step;
+        let (s0, c0) = prev.to_radians().sin_cos();
+        // Tangent at prev, pointing along the sweep direction.
+        let ctrl = point(
+            center.x - dir * tangent_len * s0,
+            center.y + dir * tangent_len * c0,
+        );
+        builder.curve_to(point_at(next), ctrl);
+        prev = next;
+    }
 }
 
+/// Appends a full circle (centered `center`, radius `r`) to a fill builder.
+pub(crate) fn append_fill_circle(
+    builder: &mut gpui::PathBuilder,
+    center: Point<Pixels>,
+    r: Pixels,
+) {
+    let k = r * 0.5523;
+    builder.move_to(point(center.x + r, center.y));
+    builder.curve_to(
+        point(center.x, center.y + r),
+        point(center.x + r, center.y + k),
+    );
+    builder.curve_to(
+        point(center.x - r, center.y),
+        point(center.x - k, center.y + r),
+    );
+    builder.curve_to(
+        point(center.x, center.y - r),
+        point(center.x - r, center.y - k),
+    );
+    builder.curve_to(
+        point(center.x + r, center.y),
+        point(center.x + k, center.y - r),
+    );
+    builder.close();
+}
+
+/// Paints one commit node in jj's conventions: `○` normal (solid dot, the
 /// Paints one commit node in jj's conventions: `○` normal (solid dot, the
 /// approved v2 base, hollow ring), `◆` immutable (filled diamond), `@`
 /// working copy and
@@ -886,35 +922,54 @@ pub(crate) fn draw_jj_node(
 
     match glyph {
         // `○`: hollow ring — mutable commits are hollow, immutable (◆)
-        // filled, mirroring jj's filled-vs-hollow distinction.
+        // filled, mirroring jj's filled-vs-hollow distinction. Drawn as a
+        // real circle path: the rounded-quad approximation rasterized
+        // slightly oval at fractional pixel positions.
         JjNodeGlyph::Normal => {
-            let diameter = radius * 2.0;
-            let bounds = gpui::Bounds::new(
-                point(center_x - radius, center_y - radius),
-                gpui::Size {
-                    width: diameter,
-                    height: diameter,
-                },
-            );
-            window.paint_quad(
-                gpui::fill(bounds, gpui::transparent_black())
-                    .corner_radii(radius)
-                    .border_widths(JJ_NODE_STROKE_WIDTH)
-                    .border_color(color),
-            );
+            let mut builder = gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
+                gpui::StrokeOptions::default()
+                    .with_line_width(f32::from(JJ_NODE_STROKE_WIDTH))
+                    .with_line_cap(LineCap::Round)
+                    .with_line_join(LineJoin::Round),
+            ));
+            builder.move_to(point(center_x + radius, center_y));
+            append_arc(&mut builder, point(center_x, center_y), radius, 0.0, 360.0);
+            builder.close();
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
         }
-        // `@`: the working copy, as jj's literal character.
+        // `@`: the working copy, drawn as paths (Lucide's at-sign geometry,
+        // scaled from its 24-unit viewBox): the inner circle plus the outer
+        // open arc. Paths render at exact float coordinates — the SVG sprite
+        // path snaps independently of the halo quad and sat off-center.
         JjNodeGlyph::WorkingCopy => {
-            paint_node_svg(
-                AT_SIGN_SVG,
-                "jj-at-sign",
-                AT_SIGN_SIZE,
-                center_x,
-                center_y,
-                color,
-                window,
-                cx,
+            let s = AT_SIGN_SIZE / 24.0;
+            let stroke = f32::from(2.4 * s);
+            let mut builder = gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
+                gpui::StrokeOptions::default()
+                    .with_line_width(stroke)
+                    .with_line_cap(LineCap::Round)
+                    .with_line_join(LineJoin::Round),
+            ));
+            // Inner circle: viewBox (12,12) r=4.
+            let inner_r = 4.0 * s;
+            builder.move_to(point(center_x + inner_r, center_y));
+            append_arc(&mut builder, point(center_x, center_y), inner_r, 0.0, 360.0);
+            // Outer open arc: viewBox circle (12,12) r=10, from (22,12) the
+            // long way around (top, left, bottom) to (18,20).
+            let outer_r = 10.0 * s;
+            builder.move_to(point(center_x + outer_r, center_y));
+            append_arc(
+                &mut builder,
+                point(center_x, center_y),
+                outer_r,
+                0.0,
+                -307.13,
             );
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
         }
         // `◆`: filled diamond.
         JjNodeGlyph::Immutable => {
@@ -948,11 +1003,24 @@ pub(crate) fn draw_jj_node(
                 window.paint_path(path, color);
             }
         }
-        // `~`: hidden — the wave mark.
+        // `~`: hidden — the wave mark, drawn as a path (the hand-drawn
+        // SVG's two cubics, scaled from its 24-unit viewBox) so it centers
+        // exactly like the other glyphs.
         JjNodeGlyph::Hidden => {
-            paint_node_svg(
-                WAVE_SVG, "jj-wave", WAVE_SIZE, center_x, center_y, color, window, cx,
-            );
+            let s = WAVE_SIZE / 24.0;
+            let at = |x: f32, y: f32| point(center_x + (x - 12.0) * s, center_y + (y - 12.0) * s);
+            let mut builder = gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
+                gpui::StrokeOptions::default()
+                    .with_line_width(f32::from(3.0 * s))
+                    .with_line_cap(LineCap::Round)
+                    .with_line_join(LineJoin::Round),
+            ));
+            builder.move_to(at(3.0, 14.5));
+            builder.curve_to(at(12.5, 12.0), at(8.5, 8.5));
+            builder.curve_to(at(21.0, 9.5), at(16.5, 15.5));
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
         }
     }
 }
@@ -1127,12 +1195,14 @@ mod tests {
             elided_row("el-h3"),
         ];
         let graph = JjGraphData::from_entries(&entries, 8);
-        assert_eq!(lanes(&graph), vec![0, 1, 0, 0, 0, 0]);
+        assert_eq!(graph.commits.len(), 6);
+        assert_eq!(lanes(&graph), vec![0, 0, 0, 0, 0, 0]);
         assert_eq!(graph.max_lanes, 2);
         assert_eq!(graph.edges.len(), 4);
         assert_eq!(graph.lines.len(), graph.edges.len());
         assert_eq!(full(edge(&graph, "h1", "x")), (0, 1, 0, 0, 0, 0));
-        assert_eq!(full(edge(&graph, "h1", "y")), (0, 1, 1, 0, 1, 0));
+        // The extra branch converges into the ~ at the primary's column.
+        assert_eq!(full(edge(&graph, "h1", "y")), (0, 1, 1, 0, 0, 0));
         assert_eq!(full(edge(&graph, "h2", "x")), (2, 3, 0, 0, 0, 0));
         assert_eq!(full(edge(&graph, "h3", "y")), (4, 5, 0, 0, 0, 0));
     }
