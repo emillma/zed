@@ -52,7 +52,7 @@ use gpui::{App, Pixels, Point, SharedString, TransformationMatrix, Window, point
 use lyon::tessellation::{LineCap, LineJoin};
 use theme::StatusColors;
 
-use crate::git_graph::{CommitLineSegment, CurveKind, LINE_WIDTH};
+use crate::git_graph::{CommitLineSegment, CurveKind};
 
 /// One row of the lane graph, aligned by index with the panel's `entries`.
 #[derive(Debug)]
@@ -809,6 +809,7 @@ pub(crate) fn node_color(
 
 const AT_SIGN_SVG: &str = include_str!("../assets/jj_at_sign.svg");
 const WAVE_SVG: &str = include_str!("../assets/jj_wave.svg");
+const CONFLICT_X_SVG: &str = include_str!("../assets/jj_conflict_x.svg");
 
 /// Node geometry for the jj panel's graph — decoupled from GitGraph's
 /// constants so the jj nodes can scale independently.
@@ -823,6 +824,7 @@ pub(crate) const JJ_GLYPH_CLEARANCE: Pixels = px(6.5);
 /// the lane lines (the commit ring is 4.5px radius).
 const AT_SIGN_SIZE: Pixels = px(13.0);
 const WAVE_SIZE: Pixels = px(12.0);
+const CONFLICT_X_SIZE: Pixels = px(10.0);
 
 /// Node marks as monochrome SVGs, tinted with the node color at paint
 /// time. The `@` is Lucide's at-sign (ISC); the wave is hand-drawn to read
@@ -974,24 +976,19 @@ pub(crate) fn draw_jj_node(
                 window.paint_path(path, color);
             }
         }
-        // `×`: two crossed strokes — arms stay inside the ring radius so
-        // the mark reads compact next to the circles.
+        // `×`: conflict — the crossed-lines mark as an SVG sprite (path
+        // stroking mangled the thin arms at this size).
         JjNodeGlyph::Conflict => {
-            // Thin butt-capped arms: round caps at this width bulge past the
-            // arm ends and read as spill.
-            let r = radius * 0.75;
-            let mut builder = gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
-                gpui::StrokeOptions::default()
-                    .with_line_width(f32::from(LINE_WIDTH) * 0.7)
-                    .with_line_cap(LineCap::Round),
-            ));
-            builder.move_to(point(center_x - r, center_y - r));
-            builder.line_to(point(center_x + r, center_y + r));
-            builder.move_to(point(center_x - r, center_y + r));
-            builder.line_to(point(center_x + r, center_y - r));
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, color);
-            }
+            paint_node_svg(
+                CONFLICT_X_SVG,
+                "jj-conflict-x",
+                CONFLICT_X_SIZE,
+                center_x,
+                center_y,
+                color,
+                window,
+                cx,
+            );
         }
         // `~`: hidden — the wave mark.
         JjNodeGlyph::Hidden => {
