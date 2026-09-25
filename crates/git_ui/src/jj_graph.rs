@@ -48,7 +48,7 @@ use std::{
 use smallvec::SmallVec;
 
 use git::jj::{JjLogEntry, JjLogFlags};
-use gpui::{App, Pixels, Point, SharedString, Window, point, px};
+use gpui::{App, Pixels, Point, SharedString, TransformationMatrix, Window, point, px};
 use lyon::tessellation::{LineCap, LineJoin};
 use theme::StatusColors;
 
@@ -807,6 +807,9 @@ pub(crate) fn node_color(
     }
 }
 
+const AT_SIGN_SVG: &str = include_str!("../assets/jj_at_sign.svg");
+const WAVE_SVG: &str = include_str!("../assets/jj_wave.svg");
+
 /// Node geometry for the jj panel's graph — decoupled from GitGraph's
 /// constants so the jj nodes can scale independently.
 pub(crate) const JJ_NODE_RADIUS: Pixels = px(3.5);
@@ -873,6 +876,36 @@ pub(crate) fn append_fill_circle(
     builder.close();
 }
 
+fn paint_node_svg(
+    svg: &'static str,
+    name: &'static str,
+    size: Pixels,
+    center_x: Pixels,
+    center_y: Pixels,
+    color: gpui::Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let half = size / 2.0;
+    let bounds = gpui::Bounds::new(
+        point(center_x - half, center_y - half),
+        gpui::Size {
+            width: size,
+            height: size,
+        },
+    );
+    window
+        .paint_svg(
+            bounds,
+            SharedString::from(name),
+            Some(svg.as_bytes()),
+            TransformationMatrix::unit(),
+            color,
+            cx,
+        )
+        .ok();
+}
+
 /// Paints one commit node in jj's conventions: `○` normal (solid dot, the
 /// approved v2 base, hollow ring), `◆` immutable (filled diamond), `@`
 /// working copy and
@@ -914,45 +947,19 @@ pub(crate) fn draw_jj_node(
                 window.paint_path(path, color);
             }
         }
-        // `@`: the working copy, drawn as a sampled polyline of Lucide's
-        // geometry (inner circle, tail + hook, outer open arc). Lines render
-        // reliably at this size; arc primitives and béziers have both
-        // misbehaved here.
+        // `@`: the working copy, as jj's literal character (SVG sprite —
+        // path-drawn variants of this glyph kept rendering wrong).
         JjNodeGlyph::WorkingCopy => {
-            let s = AT_SIGN_SIZE / 24.0;
-            let at = |x: f32, y: f32| point(center_x + (x - 12.0) * s, center_y + (y - 12.0) * s);
-            let mut builder = gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
-                gpui::StrokeOptions::default()
-                    .with_line_width(f32::from(2.4 * s))
-                    .with_line_cap(LineCap::Round)
-                    .with_line_join(LineJoin::Round),
-            ));
-            // Inner circle: viewBox (12,12) r=4.
-            builder.move_to(at(16.0, 12.0));
-            for d in 1..=36 {
-                let a = f32::from((d * 10) as u16).to_radians();
-                builder.line_to(at(12.0 + 4.0 * a.cos(), 12.0 + 4.0 * a.sin()));
-            }
-            // Tail down from (16,8), the r=3 hook bulging down from (16,13)
-            // to (22,13), then the big r=10 arc the long way around (top,
-            // left, bottom) to (18,20).
-            builder.move_to(at(16.0, 8.0));
-            builder.line_to(at(16.0, 13.0));
-            for d in (5..=18).rev() {
-                let a = f32::from((d * 10) as u16).to_radians();
-                builder.line_to(at(19.0 + 3.0 * a.cos(), 13.0 + 3.0 * a.sin()));
-            }
-            builder.line_to(at(22.0, 12.0));
-            let mut deg = 0.0f32;
-            while deg > -306.87 {
-                deg = (deg - 10.0).max(-306.87);
-                let a = deg.to_radians();
-                builder.line_to(at(12.0 + 10.0 * a.cos(), 12.0 + 10.0 * a.sin()));
-            }
-            builder.line_to(at(18.0, 20.0));
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, color);
-            }
+            paint_node_svg(
+                AT_SIGN_SVG,
+                "jj-at-sign",
+                AT_SIGN_SIZE,
+                center_x,
+                center_y,
+                color,
+                window,
+                cx,
+            );
         }
         // `◆`: filled diamond.
         JjNodeGlyph::Immutable => {
@@ -986,24 +993,11 @@ pub(crate) fn draw_jj_node(
                 window.paint_path(path, color);
             }
         }
-        // `~`: hidden — the wave mark, drawn as a path (the hand-drawn
-        // SVG's two cubics, scaled from its 24-unit viewBox) so it centers
-        // exactly like the other glyphs.
+        // `~`: hidden — the wave mark.
         JjNodeGlyph::Hidden => {
-            let s = WAVE_SIZE / 24.0;
-            let at = |x: f32, y: f32| point(center_x + (x - 12.0) * s, center_y + (y - 12.0) * s);
-            let mut builder = gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
-                gpui::StrokeOptions::default()
-                    .with_line_width(f32::from(3.0 * s))
-                    .with_line_cap(LineCap::Round)
-                    .with_line_join(LineJoin::Round),
-            ));
-            builder.move_to(at(3.0, 12.0));
-            builder.curve_to(at(12.0, 12.0), at(6.5, 5.5));
-            builder.curve_to(at(21.0, 12.0), at(17.5, 18.5));
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, color);
-            }
+            paint_node_svg(
+                WAVE_SVG, "jj-wave", WAVE_SIZE, center_x, center_y, color, window, cx,
+            );
         }
     }
 }

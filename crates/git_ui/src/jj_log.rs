@@ -656,20 +656,6 @@ impl JjLog {
             .iter()
             .map(|entry| entry.flags.clone())
             .collect();
-        // Per-row vertical clearance where lane lines start/end (absolute-row
-        // indexed): text glyphs (`@`, `~`) need more room than the circles so
-        // the lines don't cross them, plus `EDGE_BORDER_WIDTH` so the lanes'
-        // background borders keep the same gap to the glyphs the fills had.
-        let row_clearance: Vec<Pixels> = self
-            .entries
-            .iter()
-            .map(|entry| match elided_glyph(&entry.flags) {
-                JjNodeGlyph::WorkingCopy | JjNodeGlyph::Hidden => {
-                    JJ_GLYPH_CLEARANCE + EDGE_BORDER_WIDTH
-                }
-                _ => JJ_NODE_RADIUS + EDGE_BORDER_WIDTH,
-            })
-            .collect();
         // Complete edges (both endpoints in the window): pre-extract their
         // numeric geometry so the 'static canvas closure can own it (the
         // EdgeLayouts carry test-only Strings and aren't Clone). Edges whose
