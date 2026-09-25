@@ -914,46 +914,42 @@ pub(crate) fn draw_jj_node(
                 window.paint_path(path, color);
             }
         }
-        // `@`: the working copy, drawn as paths (Lucide's at-sign geometry,
-        // scaled from its 24-unit viewBox): the inner circle plus the outer
-        // open arc. Paths render at exact float coordinates — the SVG sprite
-        // path snaps independently of the halo quad and sat off-center.
+        // `@`: the working copy, drawn as a sampled polyline of Lucide's
+        // geometry (inner circle, tail + hook, outer open arc). Lines render
+        // reliably at this size; arc primitives and béziers have both
+        // misbehaved here.
         JjNodeGlyph::WorkingCopy => {
             let s = AT_SIGN_SIZE / 24.0;
-            let stroke = f32::from(2.4 * s);
+            let at = |x: f32, y: f32| point(center_x + (x - 12.0) * s, center_y + (y - 12.0) * s);
             let mut builder = gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
                 gpui::StrokeOptions::default()
-                    .with_line_width(stroke)
+                    .with_line_width(f32::from(2.4 * s))
                     .with_line_cap(LineCap::Round)
                     .with_line_join(LineJoin::Round),
             ));
             // Inner circle: viewBox (12,12) r=4.
-            let inner_r = 4.0 * s;
-            builder.move_to(point(center_x + inner_r, center_y));
-            append_arc(&mut builder, point(center_x, center_y), inner_r, 0.0, 360.0);
-            // The tail and hook, then the outer open arc — one connected
-            // subpath, straight from Lucide's path data: down from (16,8)
-            // to (16,13), the small r=3 hook bulging down to (22,13), up to
-            // (22,12), then the big r=10 arc the long way around (top,
+            builder.move_to(at(16.0, 12.0));
+            for d in 1..=36 {
+                let a = f32::from((d * 10) as u16).to_radians();
+                builder.line_to(at(12.0 + 4.0 * a.cos(), 12.0 + 4.0 * a.sin()));
+            }
+            // Tail down from (16,8), the r=3 hook bulging down from (16,13)
+            // to (22,13), then the big r=10 arc the long way around (top,
             // left, bottom) to (18,20).
-            let at = |x: f32, y: f32| point(center_x + (x - 12.0) * s, center_y + (y - 12.0) * s);
             builder.move_to(at(16.0, 8.0));
             builder.line_to(at(16.0, 13.0));
-            builder.arc_to(
-                point(3.0 * s, 3.0 * s),
-                px(0.0),
-                false,
-                false,
-                at(22.0, 13.0),
-            );
+            for d in (5..=18).rev() {
+                let a = f32::from((d * 10) as u16).to_radians();
+                builder.line_to(at(19.0 + 3.0 * a.cos(), 13.0 + 3.0 * a.sin()));
+            }
             builder.line_to(at(22.0, 12.0));
-            append_arc(
-                &mut builder,
-                point(center_x, center_y),
-                10.0 * s,
-                0.0,
-                -306.87,
-            );
+            let mut deg = 0.0f32;
+            while deg > -306.87 {
+                deg = (deg - 10.0).max(-306.87);
+                let a = deg.to_radians();
+                builder.line_to(at(12.0 + 10.0 * a.cos(), 12.0 + 10.0 * a.sin()));
+            }
+            builder.line_to(at(18.0, 20.0));
             if let Ok(path) = builder.build() {
                 window.paint_path(path, color);
             }
