@@ -1,5 +1,3 @@
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use settings::{RegisterSetting, Settings};
 
 #[derive(Debug, Clone, PartialEq, RegisterSetting)]

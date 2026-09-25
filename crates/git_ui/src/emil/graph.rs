@@ -6,10 +6,9 @@
 //! the way `jj log` draws it. No git types and no git code paths: the engine
 //! consumes jj CLI output only.
 //!
-//! The output mirrors what the GitGraph canvas consumes (per-row lane +
-//! color index, per-edge segment lists in the shared `CommitLineSegment` /
-//! `CurveKind` vocabulary), so `jj_log.rs` keeps GitGraph's drawing code and
-//! only swaps the data source.
+//! The output feeds `log.rs`'s GitGraph drawing code (per-row lane +
+//! color index, per-edge 3-part geometry as [`EdgeLayout`]), so `log.rs`
+//! keeps GitGraph's drawing code and only swaps the data source.
 //!
 //! ## jj conventions rendered on top of the lanes
 //!
@@ -41,18 +40,39 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ops::Range,
     rc::Rc,
+    sync::OnceLock,
 };
 
 use smallvec::SmallVec;
 
 use git::jj::{JjLogEntry, JjLogFlags};
-use gpui::{App, Pixels, Point, SharedString, TransformationMatrix, Window, point, px};
+use gpui::{App, Bounds, Pixels, Point, SharedString, TransformationMatrix, Window, point, px};
 use lyon::tessellation::{LineCap, LineJoin};
-use theme::StatusColors;
+use theme::{AccentColors, StatusColors};
+use time::format_description::BorrowedFormatItem;
 
-use crate::git_graph::{CommitLineSegment, CurveKind};
+// Lane geometry shared with the jj log's canvas, copied verbatim from
+// `git_graph` (the jj log's drawing was tuned against these values).
+pub(crate) const LANE_WIDTH: Pixels = px(16.0);
+pub(crate) const LEFT_PADDING: Pixels = px(12.0);
+pub(crate) const LINE_WIDTH: Pixels = px(1.5);
+
+pub(crate) fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
+    bounds.origin.x + LEFT_PADDING + lane * LANE_WIDTH + LANE_WIDTH / 2.0
+}
+
+pub(crate) fn accent_colors_count(accents: &AccentColors) -> usize {
+    accents.0.len()
+}
+
+pub(crate) fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
+    static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
+    FORMAT.get_or_init(|| {
+        time::format_description::parse("[day] [month repr:short] [year] [hour]:[minute]")
+            .unwrap_or_default()
+    })
+}
 
 /// One row of the lane graph, aligned by index with the panel's `entries`.
 #[derive(Debug)]
@@ -61,21 +81,6 @@ pub(crate) struct JjCommitRow {
     pub(crate) lane: usize,
     /// Index into the theme's accent colors for this row's lane.
     pub(crate) color_idx: usize,
-}
-
-/// One drawn edge: a child change to one of its parents.
-#[derive(Debug)]
-pub(crate) struct JjCommitLine {
-    #[cfg(test)]
-    pub(crate) child: String,
-    #[cfg(test)]
-    pub(crate) parent: String,
-    /// The lane the edge starts in (the child's lane).
-    pub(crate) child_column: usize,
-    /// Rows the edge spans, inclusive of both endpoint rows.
-    pub(crate) full_interval: Range<usize>,
-    pub(crate) color_idx: usize,
-    pub(crate) segments: SmallVec<[CommitLineSegment; 1]>,
 }
 
 /// Geometry of one child→parent edge for the 3-part edge renderer:
@@ -101,8 +106,7 @@ pub(crate) struct EdgeLayout {
     pub(crate) child_col: usize,
     /// The parent node's column.
     pub(crate) parent_col: usize,
-    /// The lane's color index: an edge inherits its lane's color, same
-    /// semantics as its sibling `JjCommitLine`.
+    /// The lane's color index: an edge inherits its lane's color.
     pub(crate) color_idx: usize,
 }
 
@@ -120,42 +124,6 @@ struct PiggybackEdge {
     column: usize,
 }
 
-impl JjCommitLine {
-    /// Mirrors GitGraph's `CommitLine::get_first_visible_segment_idx`.
-    pub(crate) fn get_first_visible_segment_idx(
-        &self,
-        first_visible_row: usize,
-    ) -> Option<(usize, usize)> {
-        if first_visible_row > self.full_interval.end {
-            return None;
-        } else if first_visible_row <= self.full_interval.start {
-            return Some((0, self.child_column));
-        }
-
-        let mut current_column = self.child_column;
-
-        for (idx, segment) in self.segments.iter().enumerate() {
-            match segment {
-                CommitLineSegment::Straight { to_row } => {
-                    if *to_row >= first_visible_row {
-                        return Some((idx, current_column));
-                    }
-                }
-                CommitLineSegment::Curve {
-                    to_column, on_row, ..
-                } => {
-                    if *on_row >= first_visible_row {
-                        return Some((idx, current_column));
-                    }
-                    current_column = *to_column;
-                }
-            }
-        }
-
-        None
-    }
-}
-
 #[derive(Debug)]
 enum JjLaneState {
     Empty,
@@ -165,151 +133,10 @@ enum JjLaneState {
         color: Option<u8>,
         starting_row: usize,
         starting_col: usize,
-        destination_column: Option<usize>,
-        segments: SmallVec<[CommitLineSegment; 1]>,
     },
 }
 
 impl JjLaneState {
-    fn to_commit_lines(
-        &mut self,
-        ending_row: usize,
-        lane_column: usize,
-        parent_column: usize,
-        parent_color: u8,
-    ) -> Option<JjCommitLine> {
-        let state = std::mem::replace(self, JjLaneState::Empty);
-
-        match state {
-            JjLaneState::Active {
-                #[cfg_attr(not(test), allow(unused_variables))]
-                child,
-                #[cfg_attr(not(test), allow(unused_variables))]
-                parent,
-                color,
-                starting_row,
-                starting_col,
-                destination_column,
-                mut segments,
-            } => {
-                let final_destination = destination_column.unwrap_or(parent_column);
-                let final_color = color.unwrap_or(parent_color);
-
-                Some(JjCommitLine {
-                    #[cfg(test)]
-                    child,
-                    #[cfg(test)]
-                    parent,
-                    child_column: starting_col,
-                    full_interval: starting_row..ending_row,
-                    color_idx: final_color as usize,
-                    segments: {
-                        match segments.last_mut() {
-                            Some(CommitLineSegment::Straight { to_row })
-                                if *to_row == usize::MAX =>
-                            {
-                                if final_destination != lane_column {
-                                    *to_row = ending_row - 1;
-
-                                    let curved_line = CommitLineSegment::Curve {
-                                        to_column: final_destination,
-                                        on_row: ending_row,
-                                        curve_kind: CurveKind::Checkout,
-                                    };
-
-                                    if *to_row == starting_row {
-                                        let last_index = segments.len() - 1;
-                                        segments[last_index] = curved_line;
-                                    } else {
-                                        segments.push(curved_line);
-                                    }
-                                } else {
-                                    *to_row = ending_row;
-                                }
-                            }
-                            Some(CommitLineSegment::Curve {
-                                on_row,
-                                to_column,
-                                curve_kind,
-                            }) if *on_row == usize::MAX => {
-                                if *to_column == usize::MAX {
-                                    *to_column = final_destination;
-                                }
-                                if matches!(curve_kind, CurveKind::Merge) {
-                                    *on_row = starting_row + 1;
-                                    if *on_row < ending_row {
-                                        if *to_column != final_destination {
-                                            segments.push(CommitLineSegment::Straight {
-                                                to_row: ending_row - 1,
-                                            });
-                                            segments.push(CommitLineSegment::Curve {
-                                                to_column: final_destination,
-                                                on_row: ending_row,
-                                                curve_kind: CurveKind::Checkout,
-                                            });
-                                        } else {
-                                            segments.push(CommitLineSegment::Straight {
-                                                to_row: ending_row,
-                                            });
-                                        }
-                                    } else if *to_column != final_destination {
-                                        segments.push(CommitLineSegment::Curve {
-                                            to_column: final_destination,
-                                            on_row: ending_row,
-                                            curve_kind: CurveKind::Checkout,
-                                        });
-                                    }
-                                } else {
-                                    *on_row = ending_row;
-                                    if *to_column != final_destination {
-                                        segments.push(CommitLineSegment::Straight {
-                                            to_row: ending_row,
-                                        });
-                                        segments.push(CommitLineSegment::Curve {
-                                            to_column: final_destination,
-                                            on_row: ending_row,
-                                            curve_kind: CurveKind::Checkout,
-                                        });
-                                    }
-                                }
-                            }
-                            Some(CommitLineSegment::Curve {
-                                on_row, to_column, ..
-                            }) => {
-                                if *on_row < ending_row {
-                                    if *to_column != final_destination {
-                                        segments.push(CommitLineSegment::Straight {
-                                            to_row: ending_row - 1,
-                                        });
-                                        segments.push(CommitLineSegment::Curve {
-                                            to_column: final_destination,
-                                            on_row: ending_row,
-                                            curve_kind: CurveKind::Checkout,
-                                        });
-                                    } else {
-                                        segments.push(CommitLineSegment::Straight {
-                                            to_row: ending_row,
-                                        });
-                                    }
-                                } else if *to_column != final_destination {
-                                    segments.push(CommitLineSegment::Curve {
-                                        to_column: final_destination,
-                                        on_row: ending_row,
-                                        curve_kind: CurveKind::Checkout,
-                                    });
-                                }
-                            }
-                            _ => {}
-                        }
-
-                        segments
-                    },
-                })
-            }
-            JjLaneState::Empty => None,
-        }
-    }
-
     fn is_empty(&self) -> bool {
         match self {
             JjLaneState::Empty => true,
@@ -328,12 +155,11 @@ pub(crate) struct JjGraphData {
     next_color: u8,
     accent_colors_count: usize,
     pub(crate) commits: Vec<Rc<JjCommitRow>>,
-    pub(crate) lines: Vec<Rc<JjCommitLine>>,
     /// Per-edge geometry for the 3-part edge renderer (see [`EdgeLayout`]).
     /// Edges to parents outside the emitted window land on the elided row
     /// after their child (`parent_col` = the edge's own column, so the
-    /// bottom stub is zero-length); a window missing that row leaves a line
-    /// in `lines` without an `EdgeLayout` (the `finish()` fallback).
+    /// bottom stub is zero-length); a window missing that row falls back to
+    /// `finish()`, which terminates the dangling edge at the last row.
     pub(crate) edges: Vec<EdgeLayout>,
     /// Lanes of edges whose parent is outside the emitted window, waiting
     /// for the elided row the data layer inserts after their child; an
@@ -364,7 +190,6 @@ impl JjGraphData {
             next_color: 0,
             accent_colors_count,
             commits: Vec::with_capacity(entries.len()),
-            lines: Vec::with_capacity(entries.len() / 2),
             edges: Vec::with_capacity(entries.len()),
             max_lanes: 0,
         };
@@ -428,36 +253,36 @@ impl JjGraphData {
                     };
                     let color = self.lane_colors.get(&lane).copied().unwrap_or(0);
                     let state = &mut self.lane_states[lane];
-                    let edge_source = match state {
+                    let (state_color, edge_source) = match state {
                         JjLaneState::Active {
                             child,
                             parent,
+                            color: lane_color,
                             starting_row,
                             starting_col,
                             ..
-                        } => Some((child.clone(), parent.clone(), *starting_row, *starting_col)),
-                        JjLaneState::Empty => None,
+                        } => (
+                            *lane_color,
+                            Some((child.clone(), parent.clone(), *starting_row, *starting_col)),
+                        ),
+                        JjLaneState::Empty => (None, None),
                     };
-                    if let Some(commit_line) =
-                        state.to_commit_lines(commit_row, lane, parent_col, color)
-                    {
-                        let color_idx = commit_line.color_idx;
-                        self.lines.push(Rc::new(commit_line));
-                        #[cfg_attr(not(test), allow(unused_variables))]
-                        if let Some((child, parent, child_row, child_col)) = edge_source {
-                            self.edges.push(EdgeLayout {
-                                #[cfg(test)]
-                                child,
-                                #[cfg(test)]
-                                parent,
-                                child_row,
-                                parent_row: commit_row,
-                                column: lane,
-                                child_col,
-                                parent_col,
-                                color_idx,
-                            });
-                        }
+                    *state = JjLaneState::Empty;
+                    #[cfg_attr(not(test), allow(unused_variables))]
+                    if let Some((child, parent, child_row, child_col)) = edge_source {
+                        let color_idx = state_color.unwrap_or(color) as usize;
+                        self.edges.push(EdgeLayout {
+                            #[cfg(test)]
+                            child,
+                            #[cfg(test)]
+                            parent,
+                            child_row,
+                            parent_row: commit_row,
+                            column: lane,
+                            child_col,
+                            parent_col,
+                            color_idx,
+                        });
                     }
                 }
 
@@ -465,18 +290,6 @@ impl JjGraphData {
                 // at the primary's column, in the shared lane's color.
                 for pig in std::mem::take(&mut self.elided_piggybacks) {
                     let color_idx = self.get_lane_color(pig.column) as usize;
-                    self.lines.push(Rc::new(JjCommitLine {
-                        #[cfg(test)]
-                        child: pig.child.clone(),
-                        #[cfg(test)]
-                        parent: pig.parent.clone(),
-                        child_column: pig.child_col,
-                        full_interval: pig.child_row..commit_row,
-                        color_idx,
-                        segments: smallvec::smallvec![CommitLineSegment::Straight {
-                            to_row: usize::MAX
-                        }],
-                    }));
                     self.edges.push(EdgeLayout {
                         #[cfg(test)]
                         child: pig.child.clone(),
@@ -510,70 +323,41 @@ impl JjGraphData {
                 for lane_column in lanes {
                     let state = &mut self.lane_states[lane_column];
 
-                    // Edge geometry, captured while the state is still Active:
-                    // `to_commit_lines` consumes it. `child`/`starting_col` are
-                    // where the edge starts, `lane_column` where its vertical
-                    // runs, `commit_lane` where the parent node sits.
-                    let edge_source = match state {
+                    // Edge geometry, captured while the state is still Active
+                    // (the reset below frees the lane). `child`/`starting_col`
+                    // are where the edge starts, `lane_column` where its
+                    // vertical runs, `commit_lane` where the parent node sits.
+                    let (state_color, edge_source) = match state {
                         JjLaneState::Active {
                             child,
                             parent,
+                            color: lane_color,
                             starting_row,
                             starting_col,
                             ..
-                        } => Some((child.clone(), parent.clone(), *starting_row, *starting_col)),
-                        JjLaneState::Empty => None,
+                        } => (
+                            *lane_color,
+                            Some((child.clone(), parent.clone(), *starting_row, *starting_col)),
+                        ),
+                        JjLaneState::Empty => (None, None),
                     };
 
-                    if let JjLaneState::Active {
-                        starting_row,
-                        segments,
-                        ..
-                    } = state
-                    {
-                        if let Some(CommitLineSegment::Curve {
-                            to_column,
-                            curve_kind: CurveKind::Merge,
-                            ..
-                        }) = segments.first_mut()
-                        {
-                            let curve_row = *starting_row + 1;
-                            let would_overlap =
-                                if lane_column != commit_lane && curve_row < commit_row {
-                                    self.commits[curve_row..commit_row]
-                                        .iter()
-                                        .any(|c| c.lane == commit_lane)
-                                } else {
-                                    false
-                                };
-
-                            if would_overlap {
-                                *to_column = lane_column;
-                            }
-                        }
-                    }
-
-                    if let Some(commit_line) =
-                        state.to_commit_lines(commit_row, lane_column, commit_lane, commit_color)
-                    {
-                        let color_idx = commit_line.color_idx;
-                        self.lines.push(Rc::new(commit_line));
-
-                        #[cfg_attr(not(test), allow(unused_variables))]
-                        if let Some((child, parent, child_row, child_col)) = edge_source {
-                            self.edges.push(EdgeLayout {
-                                #[cfg(test)]
-                                child,
-                                #[cfg(test)]
-                                parent,
-                                child_row,
-                                parent_row: commit_row,
-                                column: lane_column,
-                                child_col,
-                                parent_col: commit_lane,
-                                color_idx,
-                            });
-                        }
+                    *state = JjLaneState::Empty;
+                    #[cfg_attr(not(test), allow(unused_variables))]
+                    if let Some((child, parent, child_row, child_col)) = edge_source {
+                        let color_idx = state_color.unwrap_or(commit_color) as usize;
+                        self.edges.push(EdgeLayout {
+                            #[cfg(test)]
+                            child,
+                            #[cfg(test)]
+                            parent,
+                            child_row,
+                            parent_row: commit_row,
+                            column: lane_column,
+                            child_col,
+                            parent_col: commit_lane,
+                            color_idx,
+                        });
                     }
                 }
 
@@ -582,18 +366,6 @@ impl JjGraphData {
                 // overlap renders as one continuous line.
                 for pig in self.piggyback_edges.remove(&commit_id).unwrap_or_default() {
                     let color_idx = self.get_lane_color(pig.column) as usize;
-                    self.lines.push(Rc::new(JjCommitLine {
-                        #[cfg(test)]
-                        child: pig.child.clone(),
-                        #[cfg(test)]
-                        parent: pig.parent.clone(),
-                        child_column: pig.child_col,
-                        full_interval: pig.child_row..commit_row,
-                        color_idx,
-                        segments: smallvec::smallvec![CommitLineSegment::Straight {
-                            to_row: usize::MAX
-                        }],
-                    }));
                     self.edges.push(EdgeLayout {
                         #[cfg(test)]
                         child: pig.child.clone(),
@@ -634,10 +406,6 @@ impl JjGraphData {
                             color: Some(commit_color),
                             starting_col: commit_lane,
                             starting_row: commit_row,
-                            destination_column: None,
-                            segments: smallvec::smallvec![CommitLineSegment::Straight {
-                                to_row: usize::MAX
-                            }],
                         };
 
                         if emitted.contains(parent.as_str()) {
@@ -706,12 +474,6 @@ impl JjGraphData {
                             color: None,
                             starting_col: commit_lane,
                             starting_row: commit_row,
-                            destination_column: None,
-                            segments: smallvec::smallvec![CommitLineSegment::Curve {
-                                to_column: usize::MAX,
-                                on_row: usize::MAX,
-                                curve_kind: CurveKind::Merge,
-                            }],
                         };
 
                         if emitted.contains(parent.as_str()) {
@@ -758,14 +520,16 @@ impl JjGraphData {
         for lane in self.elided_landings.drain(..) {
             let color = self.lane_colors.get(&lane).copied().unwrap_or(0);
             let state = &mut self.lane_states[lane];
-            let (starting_row, edge_source) = match state {
+            let (state_color, starting_row, edge_source) = match state {
                 JjLaneState::Active {
                     child,
                     parent,
+                    color: lane_color,
                     starting_row,
                     starting_col,
                     ..
                 } => (
+                    *lane_color,
                     *starting_row,
                     Some((child.clone(), parent.clone(), *starting_row, *starting_col)),
                 ),
@@ -775,24 +539,21 @@ impl JjGraphData {
             if starting_row >= last_row {
                 continue;
             }
-            if let Some(commit_line) = state.to_commit_lines(last_row, lane, lane, color) {
-                let color_idx = commit_line.color_idx;
-                self.lines.push(Rc::new(commit_line));
-                #[cfg_attr(not(test), allow(unused_variables))]
-                if let Some((child, parent, child_row, child_col)) = edge_source {
-                    self.edges.push(EdgeLayout {
-                        #[cfg(test)]
-                        child,
-                        #[cfg(test)]
-                        parent,
-                        child_row,
-                        parent_row: last_row,
-                        column: lane,
-                        child_col,
-                        parent_col: lane,
-                        color_idx,
-                    });
-                }
+            *state = JjLaneState::Empty;
+            #[cfg_attr(not(test), allow(unused_variables))]
+            if let Some((child, parent, child_row, child_col)) = edge_source {
+                self.edges.push(EdgeLayout {
+                    #[cfg(test)]
+                    child,
+                    #[cfg(test)]
+                    parent,
+                    child_row,
+                    parent_row: last_row,
+                    column: lane,
+                    child_col,
+                    parent_col: lane,
+                    color_idx: state_color.unwrap_or(color) as usize,
+                });
             }
         }
     }
@@ -859,9 +620,9 @@ pub(crate) fn node_color(
     }
 }
 
-const AT_SIGN_SVG: &str = include_str!("../assets/jj_at_sign.svg");
-const WAVE_SVG: &str = include_str!("../assets/jj_wave.svg");
-const CONFLICT_X_SVG: &str = include_str!("../assets/jj_conflict_x.svg");
+const AT_SIGN_SVG: &str = include_str!("../../assets/jj_at_sign.svg");
+const WAVE_SVG: &str = include_str!("../../assets/jj_wave.svg");
+const CONFLICT_X_SVG: &str = include_str!("../../assets/jj_conflict_x.svg");
 
 /// Node geometry for the jj panel's graph — decoupled from GitGraph's
 /// constants so the jj nodes can scale independently.
@@ -881,17 +642,6 @@ const CONFLICT_X_SIZE: Pixels = px(14.0);
 /// Node marks as monochrome SVGs, tinted with the node color at paint
 /// time. The `@` is Lucide's at-sign (ISC); the wave is hand-drawn to read
 /// as jj's elision mark at node scale.
-
-/// A stroke path builder with round caps and joins — the node marks read
-/// softer than lyon's default butt caps.
-fn round_stroke_builder(width: Pixels) -> gpui::PathBuilder {
-    gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
-        gpui::StrokeOptions::default()
-            .with_line_width(f32::from(width))
-            .with_line_cap(LineCap::Round)
-            .with_line_join(LineJoin::Round),
-    ))
-}
 
 /// Appends a circular arc (centered `center`, radius `r`) from `start_deg` to
 /// `end_deg` — degrees in y-down screen coordinates — to the builder, which
@@ -1073,7 +823,7 @@ mod tests {
     }
 
     /// A synthesized `(elided revisions)` row (the data layer builds these
-    /// in `jj_log`, Phase C2; the layout just consumes them).
+    /// in `log`, Phase C2; the layout just consumes them).
     fn elided_row(change_id: &str) -> JjLogEntry {
         let mut entry = entry(change_id, &[]);
         entry.flags.elided = true;
@@ -1135,7 +885,7 @@ mod tests {
         let graph = JjGraphData::from_entries(&entries, 8);
         assert_eq!(lanes(&graph), vec![0, 0, 0]);
         // Two edges: c→b, b→a. The root (a) has no outgoing edge.
-        assert_eq!(graph.lines.len(), 2);
+        assert_eq!(graph.edges.len(), 2);
         assert_eq!(graph.max_lanes, 1);
     }
 
@@ -1145,7 +895,7 @@ mod tests {
         let graph = JjGraphData::from_entries(&entries, 8);
         // b1 takes lane 0; b2 lands in a fresh lane; both edges curve into a.
         assert_eq!(lanes(&graph), vec![0, 1, 0]);
-        assert_eq!(graph.lines.len(), 2);
+        assert_eq!(graph.edges.len(), 2);
         assert_eq!(graph.max_lanes, 2);
         let colors: Vec<usize> = graph.commits.iter().map(|row| row.color_idx).collect();
         assert_ne!(colors[0], colors[1]);
@@ -1161,24 +911,12 @@ mod tests {
         ];
         let graph = JjGraphData::from_entries(&entries, 8);
         assert_eq!(lanes(&graph), vec![0, 1, 0, 0]);
-        // m→b1 (straight in lane 0), m→b2 (merge curve), b2→a, b1→a.
-        assert_eq!(graph.lines.len(), 4);
-        let merge_line = graph
-            .lines
-            .iter()
-            .find(|line| {
-                line.segments.iter().any(|s| {
-                    matches!(
-                        s,
-                        CommitLineSegment::Curve {
-                            curve_kind: CurveKind::Merge,
-                            ..
-                        }
-                    )
-                })
-            })
-            .expect("a merge curve exists");
-        assert_eq!(merge_line.child_column, 0);
+        // m→b1 (straight in lane 0), m→b2 (merge edge), b2→a, b1→a.
+        assert_eq!(graph.edges.len(), 4);
+        // The merge edge starts at the child (col 0) and runs down its
+        // fresh lane to the second parent.
+        assert_eq!(edge(&graph, "m", "b2").child_col, 0);
+        assert_eq!(edge(&graph, "m", "b2").column, 1);
     }
 
     #[test]
@@ -1189,9 +927,10 @@ mod tests {
         // it is skipped.
         let entries = vec![entry("b", &["outside"]), entry("a", &["outside"])];
         let graph = JjGraphData::from_entries(&entries, 8);
-        assert_eq!(graph.lines.len(), 1);
+        assert_eq!(graph.edges.len(), 1);
         assert_eq!(
-            graph.lines[0].full_interval.end, 1,
+            edge(&graph, "b", "outside").parent_row,
+            1,
             "edge terminates at the last row"
         );
     }
@@ -1203,7 +942,7 @@ mod tests {
         let entries = vec![entry("d", &["a"]), entry("d", &["a"]), entry("a", &[])];
         let graph = JjGraphData::from_entries(&entries, 8);
         assert_eq!(lanes(&graph), vec![0, 1, 0]);
-        assert_eq!(graph.lines.len(), 2);
+        assert_eq!(graph.edges.len(), 2);
     }
 
     #[test]
@@ -1227,7 +966,6 @@ mod tests {
         // one line through the ~, no lane sprawl.
         assert_eq!(graph.max_lanes, 1);
         assert_eq!(graph.edges.len(), 4);
-        assert_eq!(graph.lines.len(), graph.edges.len());
         assert_eq!(full(edge(&graph, "h1", "x")), (0, 1, 0, 0, 0, 0));
         // The extra branch overlaps the primary's column and converges into
         // the ~ at the same column.
@@ -1250,7 +988,6 @@ mod tests {
         ];
         let graph = JjGraphData::from_entries(&entries, 8);
         assert_eq!(lanes(&graph), vec![0, 1, 0, 1, 0]);
-        assert_eq!(graph.edges.len(), graph.lines.len());
         assert_eq!(full(edge(&graph, "c1", "p")), (0, 2, 0, 0, 0, 0));
         assert_eq!(full(edge(&graph, "c2", "p")), (1, 2, 1, 1, 0, 1));
         assert_eq!(full(edge(&graph, "p", "a")), (2, 4, 0, 0, 0, 0));
@@ -1300,7 +1037,6 @@ mod tests {
         // parents' edges take leftmost-free lanes topmost-first: p3 (row 1)
         // gets lane 1, p2 (row 2) lane 2 — the fan starts from the top.
         assert_eq!(lanes(&graph), vec![0, 1, 2, 0, 0]);
-        assert_eq!(graph.edges.len(), graph.lines.len());
         assert_eq!(full(edge(&graph, "m", "p1")), (0, 3, 0, 0, 0, 0));
         assert_eq!(full(edge(&graph, "m", "p2")), (0, 2, 2, 0, 2, 2));
         assert_eq!(full(edge(&graph, "m", "p3")), (0, 1, 1, 0, 1, 1));
@@ -1324,7 +1060,6 @@ mod tests {
         // lane 3.
         assert_eq!(lanes(&graph), vec![0, 1, 2, 3, 0, 0]);
         assert_eq!(graph.max_lanes, 4);
-        assert_eq!(graph.edges.len(), graph.lines.len());
         assert_eq!(full(edge(&graph, "m", "p1")), (0, 4, 0, 0, 0, 0));
         assert_eq!(full(edge(&graph, "m", "p2")), (0, 3, 3, 0, 3, 3));
         assert_eq!(full(edge(&graph, "m", "p3")), (0, 2, 2, 0, 2, 2));
@@ -1355,7 +1090,7 @@ mod tests {
     fn elided_rows_land_dangling_edges() {
         // The C1 fixture: @ merges two branches, each of whose next row has
         // its parent outside the window. The elided rows are hand-built (the
-        // synthesis itself lands in `jj_log` in C2): the data layer inserts
+        // synthesis itself lands in `log` in C2): the data layer inserts
         // one directly after each row whose parent is missing.
         let mut at = entry("kozmttlk", &["rzvnrvrz", "xpzmvpqp"]);
         at.flags.working_copy = true;
@@ -1374,9 +1109,8 @@ mod tests {
         // root reusing the freed lane 0 — nothing sprawls a fresh lane.
         assert_eq!(lanes(&graph), vec![0, 1, 1, 0, 0, 0]);
         assert_eq!(graph.max_lanes, 2);
-        // Every edge lands on a row: no line is left dangling in `lines`.
+        // Every edge lands on a row.
         assert_eq!(graph.edges.len(), 4);
-        assert_eq!(graph.lines.len(), graph.edges.len());
         // @→rzvnrvrz runs down lane 0, passing the elided row at row 2.
         assert_eq!(
             full(edge(&graph, "kozmttlk", "rzvnrvrz")),
@@ -1421,7 +1155,6 @@ mod tests {
         assert_eq!(full(edge(&graph, "m", "p3")), (0, 2, 1, 0, 1, 1));
         assert_eq!(full(edge(&graph, "p3", "a")), (2, 4, 1, 1, 1, 1));
         assert_eq!(full(edge(&graph, "p2", "a")), (3, 4, 2, 2, 1, 2));
-        assert_eq!(graph.lines.len(), graph.edges.len());
     }
 
     #[test]
@@ -1441,7 +1174,6 @@ mod tests {
         let graph = JjGraphData::from_entries(&entries, 8);
         // x continues b's lane (min-incoming), hence the trailing 1.
         assert_eq!(lanes(&graph), vec![0, 2, 3, 1, 0, 1]);
-        assert_eq!(graph.edges.len(), graph.lines.len());
         // The piggyback edge runs between its endpoints (col 3 -> col 1 via
         // the sibling's lane 2) and takes the shared lane's color, so the
         // overlap with c1's edge reads as one continuous line.
@@ -1465,7 +1197,6 @@ mod tests {
         assert_eq!(lanes(&graph), vec![0, 0, 0]);
         assert_eq!(graph.max_lanes, 1, "no lane sprawl for missing parents");
         assert_eq!(graph.edges.len(), 3);
-        assert_eq!(graph.lines.len(), graph.edges.len());
         assert_eq!(full(edge(&graph, "m", "o1")), (0, 1, 0, 0, 0, 0));
         // The collapsed extras overlap the primary's column and converge
         // into the ~ at the same column.
@@ -1477,7 +1208,6 @@ mod tests {
     fn empty_window_produces_nothing() {
         let graph = JjGraphData::from_entries(&[], 8);
         assert!(graph.commits.is_empty());
-        assert!(graph.lines.is_empty());
         assert!(graph.edges.is_empty());
         assert_eq!(graph.max_lanes, 0);
     }

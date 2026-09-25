@@ -1,11 +1,9 @@
-use crate::git_graph::{
-    LANE_WIDTH, LEFT_PADDING, LINE_WIDTH, accent_colors_count, lane_center_x, timestamp_format,
+use crate::emil::graph::{
+    JJ_GLYPH_CLEARANCE, JJ_NODE_RADIUS, JjGraphData, JjNodeGlyph, LANE_WIDTH, LEFT_PADDING,
+    LINE_WIDTH, NodeStatusColors, accent_colors_count, append_fill_circle, draw_jj_node,
+    lane_center_x, node_color, node_glyph, timestamp_format,
 };
-use crate::jj_graph::{
-    JJ_GLYPH_CLEARANCE, JJ_NODE_RADIUS, JjGraphData, JjNodeGlyph, NodeStatusColors,
-    append_fill_circle, draw_jj_node, node_color, node_glyph,
-};
-use crate::jj_settings::JjSettings;
+use crate::emil::settings::JjSettings;
 use anyhow::Result;
 use editor::Editor;
 use git::jj::{JjLogEntry, JjLogFlags};
@@ -59,13 +57,6 @@ const COMMIT_COLUMN_FRACTION: f32 = 0.0516;
 /// path) never self-cut.
 const EDGE_BORDER_WIDTH: Pixels = px(1.0);
 
-/// Clearance from a node center to where an edge stub attaches or ends: just
-/// outside the glyph (radius) plus the lane's background border, so a stub
-/// (and its border) never cuts a node glyph.
-///
-/// `JJ_NODE_RADIUS + EDGE_BORDER_WIDTH` (5.5px), written out because
-/// `Pixels`' derived `Add` is not `const`.
-const JJ_EDGE_CLEARANCE: Pixels = px(5.5);
 /// y-offset of the stubs from their node centers. The bottom stub attaches
 /// BELOW the child node (the edge exits through the node's bottom) and the
 /// top stub ABOVE the parent node (it enters through the node's top) — the
@@ -618,7 +609,7 @@ impl JjLog {
     /// Paints the lane graph over the table's visible rows, synced to the
     /// table's scroll state exactly like GitGraph: rows and lanes are shifted
     /// table's scroll offset and only the visible range is painted.
-    /// Every edge is drawn from `jj_graph`'s `EdgeLayout` as up to three
+    /// Every edge is drawn from `graph`'s `EdgeLayout` as up to three
     /// fragments (bottom stub, vertical, top stub), z-ordered by layer.
     fn render_graph_canvas(
         &self,
@@ -1138,7 +1129,7 @@ fn elided_entry(index: usize) -> JjLogEntry {
 }
 
 /// A row's node glyph: the synthetic elided rows render as the hidden wave
-/// mark — `node_glyph` (in `jj_graph`, layout-only) doesn't know the
+/// mark — `node_glyph` (in `graph`, layout-only) doesn't know the
 /// `elided` flag, so the panel maps it here.
 fn elided_glyph(flags: &JjLogFlags) -> JjNodeGlyph {
     if flags.elided {

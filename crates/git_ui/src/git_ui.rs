@@ -41,15 +41,12 @@ pub mod commit_tooltip;
 pub mod commit_view;
 mod conflict_view;
 mod diff_multibuffer;
+pub mod emil;
 pub mod git_graph;
 pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
-pub mod jj_graph;
-pub mod jj_log;
-pub mod jj_settings;
-mod jj_status;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
@@ -63,13 +60,13 @@ pub mod unstaged_diff;
 
 pub use blame_ui::GitBlameStatus;
 pub use conflict_view::MergeConflictIndicator;
-pub use jj_status::JjStatusIndicator;
+pub use emil::JjStatusIndicator;
 
 pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     git_graph::init(cx);
-    jj_log::init(cx);
+    emil::init(cx);
 
     git_ui_core::set_branch_picker_builder(
         |workspace, repository, window, cx| {
