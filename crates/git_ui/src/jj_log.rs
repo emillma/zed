@@ -16,7 +16,7 @@ use gpui::{
 };
 use menu::Confirm;
 use project::git_store::{GitStore, GitStoreEvent, RepositoryEvent};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
@@ -102,7 +102,6 @@ impl LaneEdge {
         self.border.line_to(to);
         self.fill.line_to(to);
     }
-
 }
 
 /// The color painted behind the lanes — must match what actually renders
@@ -318,6 +317,12 @@ impl JjLog {
                         // dangling edge lands on a real row (and the table
                         // shows the cut-off) instead of running to the
                         // window's end.
+                        // First reorder into jj's topo-grouped display order:
+                        // `jj log` runs TopoGroupedGraph over the revset
+                        // before rendering, and the lane layout needs that
+                        // same order or lanes stay occupied across huge row
+                        // gaps.
+                        let entries = topo_group_entries(entries);
                         let entries = synthesize_elided_entries(entries);
                         let graph_data = JjGraphData::from_entries(
                             &entries,
@@ -638,8 +643,7 @@ impl JjLog {
             .iter()
             .filter(|edge| edge.column < MAX_EDGE_COLUMN)
             .filter(|edge| {
-                edge.child_row <= viewport_range.end
-                    && edge.parent_row >= viewport_range.start
+                edge.child_row <= viewport_range.end && edge.parent_row >= viewport_range.start
             })
             .map(|edge| EdgeGeom {
                 child_row: edge.child_row,
@@ -769,9 +773,7 @@ impl JjLog {
                     });
 
                     for EdgePart {
-                        lane,
-                        color_idx,
-                        ..
+                        lane, color_idx, ..
                     } in parts
                     {
                         let line_color = accent_colors.color_for_index(color_idx as u32);
@@ -813,6 +815,212 @@ fn format_timestamp(timestamp: i64) -> String {
 /// Must run before `JjGraphData::from_entries`: the layout lands dangling
 /// edges on these rows, and the stored entry list must be the synthesized
 /// one, or the table and the canvas disagree on row indices.
+/// Reorders the entries into jj's `TopoGroupedGraph` display order — a
+/// synchronous port of jj v0.45.1's `TopoGroupedGraph` (core/src/graph.rs),
+/// which `jj log` runs over the revset before rendering. Zed's raw revset
+/// order is topologically valid but interleaves branches arbitrarily; feeding
+/// it straight to the lane layout makes lanes stay occupied across huge row
+/// gaps and the graph sprawls. The port keeps jj's exact tie-breaking so the
+/// panel's row order (and thus the lane assignment) matches `jj log`:
+///
+/// - DFS from heads: when a node is emitted, its in-window parents whose last
+///   child this was are pushed onto a LIFO stack — at a merge, the *last*
+///   parent's branch is walked first.
+/// - Heads discovered while populating are queued, never emitted eagerly; a
+///   head starts only once the stack runs dry, and `flush_new_head` picks the
+///   queued head that actually unblocks the waiting ancestors.
+/// - Nodes populate lazily from the input so head-discovery order matches
+///   jj's, even though the whole window is already in memory.
+fn topo_group_entries(entries: Vec<JjLogEntry>) -> Vec<JjLogEntry> {
+    if entries.len() < 2 {
+        return entries;
+    }
+    let in_window: HashSet<SharedString> = entries
+        .iter()
+        .map(|entry| entry.change_id.clone())
+        .collect();
+
+    struct Node {
+        /// Graph nodes which must be emitted before this one.
+        child_ids: HashSet<SharedString>,
+        /// `None` until this node is populated from the input.
+        item: Option<JjLogEntry>,
+    }
+
+    impl Default for Node {
+        fn default() -> Self {
+            Self {
+                child_ids: HashSet::new(),
+                item: None,
+            }
+        }
+    }
+
+    let mut nodes: HashMap<SharedString, Node> = HashMap::new();
+    let mut emittable_ids: Vec<SharedString> = Vec::new();
+    let mut new_head_ids: VecDeque<SharedString> = VecDeque::new();
+    let mut blocked_ids: HashSet<SharedString> = HashSet::new();
+    let mut input = entries.into_iter();
+    let mut out = Vec::new();
+
+    // Reference `populate_one`: pull one entry, register it in each
+    // in-window parent's child set (creating the parent placeholder), then
+    // either fill a placeholder or queue a new head.
+    // Returns false when the input is exhausted.
+    fn populate_one(
+        input: &mut std::vec::IntoIter<JjLogEntry>,
+        nodes: &mut HashMap<SharedString, Node>,
+        new_head_ids: &mut VecDeque<SharedString>,
+        in_window: &HashSet<SharedString>,
+    ) -> bool {
+        let Some(entry) = input.next() else {
+            return false;
+        };
+        let id = entry.change_id.clone();
+        for parent in &entry.parent_change_ids {
+            if in_window.contains(parent) {
+                nodes
+                    .entry(parent.clone())
+                    .or_default()
+                    .child_ids
+                    .insert(id.clone());
+            }
+        }
+        match nodes.get_mut(&id) {
+            Some(node) => {
+                debug_assert!(node.item.is_none());
+                node.item = Some(entry);
+            }
+            None => {
+                nodes.insert(
+                    id.clone(),
+                    Node {
+                        child_ids: HashSet::new(),
+                        item: Some(entry),
+                    },
+                );
+                new_head_ids.push_back(id);
+            }
+        }
+        true
+    }
+
+    // Reference `flush_new_head`: enqueue the first queued head that will
+    // unblock the waiting ancestors.
+    let flush_new_head = |nodes: &mut HashMap<SharedString, Node>,
+                          new_head_ids: &mut VecDeque<SharedString>,
+                          blocked_ids: &mut HashSet<SharedString>,
+                          emittable_ids: &mut Vec<SharedString>| {
+        if blocked_ids.is_empty() || new_head_ids.len() <= 1 {
+            // Fast path: orphaned or no choice.
+            let new_head_id = new_head_ids.pop_front().unwrap();
+            emittable_ids.push(new_head_id);
+            blocked_ids.clear();
+            return;
+        }
+
+        // Mark descendant nodes reachable from the blocking nodes.
+        let mut to_visit: Vec<SharedString> = blocked_ids
+            .iter()
+            .filter(|id| nodes.contains_key(*id))
+            .cloned()
+            .collect();
+        let mut visited: HashSet<SharedString> = to_visit.iter().cloned().collect();
+        while let Some(id) = to_visit.pop() {
+            if let Some(node) = nodes.get(&id) {
+                to_visit.extend(
+                    node.child_ids
+                        .iter()
+                        .filter(|id| visited.insert((*id).clone()))
+                        .cloned(),
+                );
+            }
+        }
+
+        // Pick the first reachable head.
+        let index = new_head_ids
+            .iter()
+            .position(|id| visited.contains(id))
+            .unwrap_or_else(|| {
+                // The blocking head should exist; fall back to the oldest
+                // queued head rather than panicking on unexpected input.
+                0
+            });
+        let new_head_id = new_head_ids.remove(index).unwrap();
+
+        // Unmark ancestors of the selected head so they don't contribute to
+        // future new-head resolution within the newly-unblocked subgraph.
+        let mut to_visit = vec![new_head_id.clone()];
+        visited.remove(&new_head_id);
+        while let Some(id) = to_visit.pop() {
+            if let Some(node) = nodes.get(&id) {
+                if let Some(item) = &node.item {
+                    to_visit.extend(
+                        item.parent_change_ids
+                            .iter()
+                            .filter(|id| visited.remove(*id))
+                            .cloned(),
+                    );
+                }
+            }
+        }
+        blocked_ids.retain(|id| visited.contains(id));
+        emittable_ids.push(new_head_id);
+    };
+
+    loop {
+        if let Some(current_id) = emittable_ids.last().cloned() {
+            let Some(current_node) = nodes.get_mut(&current_id) else {
+                // Queued twice because new children populated and emitted.
+                emittable_ids.pop();
+                continue;
+            };
+            if !current_node.child_ids.is_empty() {
+                // New children populated after emitting the other branch.
+                let current_id = emittable_ids.pop().unwrap();
+                blocked_ids.insert(current_id);
+                continue;
+            }
+            let Some(item) = current_node.item.take() else {
+                // Not yet populated.
+                if !populate_one(&mut input, &mut nodes, &mut new_head_ids, &in_window) {
+                    // Input exhausted with an unpopulated placeholder: the
+                    // parent never appears in the window. Drop it and move
+                    // on instead of panicking like the reference does.
+                    emittable_ids.pop();
+                }
+                continue;
+            };
+            // The second (or the last) parent will be visited first.
+            emittable_ids.pop();
+            nodes.remove(&current_id);
+            for parent in &item.parent_change_ids {
+                if !in_window.contains(parent) {
+                    continue;
+                }
+                let parent_node = nodes.get_mut(parent).unwrap();
+                parent_node.child_ids.remove(&current_id);
+                if parent_node.child_ids.is_empty() {
+                    let reusable_id = blocked_ids.take(parent);
+                    emittable_ids.push(reusable_id.unwrap_or_else(|| parent.clone()));
+                } else {
+                    blocked_ids.insert(parent.clone());
+                }
+            }
+            out.push(item);
+        } else if !new_head_ids.is_empty() {
+            flush_new_head(
+                &mut nodes,
+                &mut new_head_ids,
+                &mut blocked_ids,
+                &mut emittable_ids,
+            );
+        } else if !populate_one(&mut input, &mut nodes, &mut new_head_ids, &in_window) {
+            return out;
+        }
+    }
+}
+
 fn synthesize_elided_entries(entries: Vec<JjLogEntry>) -> Vec<JjLogEntry> {
     // Owned: the loop below moves `entries`, so the window's id set cannot
     // borrow from it.
@@ -1442,15 +1650,85 @@ mod persistence {
 mod tests {
     use super::*;
 
+    /// Acceptance check against real fixture data: the topo-grouped row
+    /// order must equal `jj log`'s own rendering order. The reference files
+    /// are produced by the diagnostic session (out.jsonl = the exact JSONL
+    /// Zed's CLI call emits for the fixture's default revset; order_graph.txt
+    /// = the row order of `jj log --graph` for the same revset, one
+    /// change-id prefix per line). Skipped when the files are absent so the
+    /// suite stays portable.
+    #[test]
+    fn topo_order_matches_jj_log_on_real_fixture_data() {
+        let jsonl_path = "/home/emil/mono/.tmp/out.jsonl";
+        let order_path = "/home/emil/mono/.tmp/order_graph.txt";
+        let (Ok(jsonl), Ok(order)) = (
+            std::fs::read_to_string(jsonl_path),
+            std::fs::read_to_string(order_path),
+        ) else {
+            eprintln!("skipping: reference files not present");
+            return;
+        };
+
+        #[derive(serde::Deserialize)]
+        struct Line {
+            commit: Commit,
+            #[serde(rename = "parent_change_ids")]
+            parent_change_ids: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Commit {
+            change_id: String,
+        }
+        let entries: Vec<JjLogEntry> = jsonl
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let line: Line = serde_json::from_str(line).unwrap();
+                JjLogEntry {
+                    change_id: line.commit.change_id.into(),
+                    commit_id: SharedString::default(),
+                    parents: Vec::new(),
+                    parent_change_ids: line
+                        .parent_change_ids
+                        .into_iter()
+                        .map(SharedString::from)
+                        .collect(),
+                    bookmarks: Vec::new(),
+                    tags: Vec::new(),
+                    description: SharedString::default(),
+                    author_name: SharedString::default(),
+                    author_email: SharedString::default(),
+                    commit_timestamp: 0,
+                    flags: JjLogFlags::default(),
+                    is_merge: false,
+                    is_head: false,
+                    dist_to_head: None,
+                }
+            })
+            .collect();
+        let expected: Vec<String> = order
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        let grouped = topo_group_entries(entries);
+        let actual: Vec<String> = grouped
+            .iter()
+            .map(|entry| entry.change_id.to_string().chars().take(12).collect())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "topo-grouped row order must match jj log's rendering order"
+        );
+    }
+
     fn test_entry(change_id: &str, parents: &[&str]) -> JjLogEntry {
         JjLogEntry {
             change_id: change_id.into(),
             commit_id: format!("commit-{change_id}").into(),
             parents: Vec::new(),
-            parent_change_ids: parents
-                .iter()
-                .map(|parent| (*parent).into())
-                .collect(),
+            parent_change_ids: parents.iter().map(|parent| (*parent).into()).collect(),
             bookmarks: Vec::new(),
             tags: Vec::new(),
             description: SharedString::default(),
@@ -1481,7 +1759,9 @@ mod tests {
         let ids: Vec<&str> = rows.iter().map(|row| row.change_id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["kozmttlk", "xpzmvpqp", "elided-0", "rzvnrvrz", "elided-1", "root"]
+            vec![
+                "kozmttlk", "xpzmvpqp", "elided-0", "rzvnrvrz", "elided-1", "root"
+            ]
         );
         for (index, row) in rows.iter().enumerate() {
             assert_eq!(row.flags.elided, index == 2 || index == 4);
