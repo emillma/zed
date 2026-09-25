@@ -809,7 +809,7 @@ pub(crate) fn node_color(
 
 /// Node geometry for the jj panel's graph — decoupled from GitGraph's
 /// constants so the jj nodes can scale independently.
-pub(crate) const JJ_NODE_RADIUS: Pixels = px(4.5);
+pub(crate) const JJ_NODE_RADIUS: Pixels = px(3.5);
 pub(crate) const JJ_NODE_STROKE_WIDTH: Pixels = px(2.0);
 /// Vertical clearance between a node and the lane lines' endpoints: text
 /// glyphs (`@`, `~`) need more room than the circles so the lines don't
@@ -931,16 +931,28 @@ pub(crate) fn draw_jj_node(
             let inner_r = 4.0 * s;
             builder.move_to(point(center_x + inner_r, center_y));
             append_arc(&mut builder, point(center_x, center_y), inner_r, 0.0, 360.0);
-            // Outer open arc: viewBox circle (12,12) r=10, from (22,12) the
-            // long way around (top, left, bottom) to (18,20).
-            let outer_r = 10.0 * s;
-            builder.move_to(point(center_x + outer_r, center_y));
+            // The tail and hook, then the outer open arc — one connected
+            // subpath, straight from Lucide's path data: down from (16,8)
+            // to (16,13), the small r=3 hook bulging down to (22,13), up to
+            // (22,12), then the big r=10 arc the long way around (top,
+            // left, bottom) to (18,20).
+            let at = |x: f32, y: f32| point(center_x + (x - 12.0) * s, center_y + (y - 12.0) * s);
+            builder.move_to(at(16.0, 8.0));
+            builder.line_to(at(16.0, 13.0));
+            builder.arc_to(
+                point(3.0 * s, 3.0 * s),
+                px(0.0),
+                false,
+                false,
+                at(22.0, 13.0),
+            );
+            builder.line_to(at(22.0, 12.0));
             append_arc(
                 &mut builder,
                 point(center_x, center_y),
-                outer_r,
+                10.0 * s,
                 0.0,
-                -307.13,
+                -306.87,
             );
             if let Ok(path) = builder.build() {
                 window.paint_path(path, color);
@@ -968,7 +980,7 @@ pub(crate) fn draw_jj_node(
             let mut builder = gpui::PathBuilder::default().with_style(gpui::PathStyle::Stroke(
                 gpui::StrokeOptions::default()
                     .with_line_width(f32::from(LINE_WIDTH) * 0.7)
-                    .with_line_cap(LineCap::Butt),
+                    .with_line_cap(LineCap::Round),
             ));
             builder.move_to(point(center_x - r, center_y - r));
             builder.line_to(point(center_x + r, center_y + r));
@@ -990,9 +1002,9 @@ pub(crate) fn draw_jj_node(
                     .with_line_cap(LineCap::Round)
                     .with_line_join(LineJoin::Round),
             ));
-            builder.move_to(at(3.0, 14.5));
-            builder.curve_to(at(12.5, 12.0), at(8.5, 8.5));
-            builder.curve_to(at(21.0, 9.5), at(16.5, 15.5));
+            builder.move_to(at(3.0, 12.0));
+            builder.curve_to(at(12.0, 12.0), at(6.5, 5.5));
+            builder.curve_to(at(21.0, 12.0), at(17.5, 18.5));
             if let Ok(path) = builder.build() {
                 window.paint_path(path, color);
             }
