@@ -725,22 +725,10 @@ impl JjLog {
                         let col_x = lane_center_x(bounds, edge.column as f32);
                         let child_x = lane_center_x(bounds, edge.child_col as f32);
                         let parent_x = lane_center_x(bounds, edge.parent_col as f32);
-                        // Stubs are tangential to the node's halo from the
-                        // inside: the line's outer edge touches the halo
-                        // circle (offset = halo radius − half line width).
-                        let line_half = LINE_WIDTH / 2.0;
-                        let b_y = row_y(edge.child_row)
-                            + row_clearance
-                                .get(edge.child_row)
-                                .copied()
-                                .unwrap_or(EDGE_STUB_OFFSET)
-                            - line_half;
-                        let t_y = row_y(edge.parent_row)
-                            - row_clearance
-                                .get(edge.parent_row)
-                                .copied()
-                                .unwrap_or(EDGE_STUB_OFFSET)
-                            + line_half;
+                        // Stubs attach close to the node center (a couple
+                        // of pixels out) — the halo masks the junction.
+                        let b_y = row_y(edge.child_row) + EDGE_STUB_OFFSET;
+                        let t_y = row_y(edge.parent_row) - EDGE_STUB_OFFSET;
 
                         let reach = edge.reach();
                         // Rounded bend radius, as the old per-lane renderer

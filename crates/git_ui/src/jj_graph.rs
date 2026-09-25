@@ -48,7 +48,7 @@ use std::{
 use smallvec::SmallVec;
 
 use git::jj::{JjLogEntry, JjLogFlags};
-use gpui::{App, PathStyle, Pixels, Point, SharedString, Window, point, px};
+use gpui::{App, Pixels, Point, SharedString, Window, point, px};
 use lyon::tessellation::{LineCap, LineJoin};
 use theme::StatusColors;
 
@@ -838,8 +838,8 @@ fn round_stroke_builder(width: Pixels) -> gpui::PathBuilder {
 
 /// Appends a circular arc (centered `center`, radius `r`) from `start_deg` to
 /// `end_deg` — degrees in y-down screen coordinates — to the builder, which
-/// must already be positioned at the arc's start point. Approximated with
-/// quadratic beziers of at most 45° each (gpui's `curve_to` is quadratic).
+/// must already be positioned at the arc's start point. Uses gpui's native
+/// elliptical-arc primitive in ≤90° chunks.
 pub(crate) fn append_arc(
     builder: &mut gpui::PathBuilder,
     center: Point<Pixels>,
@@ -848,10 +848,8 @@ pub(crate) fn append_arc(
     end_deg: f32,
 ) {
     let sweep = end_deg - start_deg;
-    let segments = ((sweep.abs() / 45.0).ceil() as usize).max(1);
+    let segments = ((sweep.abs() / 90.0).ceil() as usize).max(1);
     let step = sweep / segments as f32;
-    let tangent_len = r * (step.to_radians() / 2.0).tan();
-    let dir = if step > 0.0 { 1.0 } else { -1.0 };
     let point_at = |deg: f32| -> Point<Pixels> {
         let (s, c) = deg.to_radians().sin_cos();
         point(center.x + r * c, center.y + r * s)
@@ -859,13 +857,7 @@ pub(crate) fn append_arc(
     let mut prev = start_deg;
     for _ in 0..segments {
         let next = prev + step;
-        let (s0, c0) = prev.to_radians().sin_cos();
-        // Tangent at prev, pointing along the sweep direction.
-        let ctrl = point(
-            center.x - dir * tangent_len * s0,
-            center.y + dir * tangent_len * c0,
-        );
-        builder.curve_to(point_at(next), ctrl);
+        builder.arc_to(point(r, r), px(0.0), false, step > 0.0, point_at(next));
         prev = next;
     }
 }
@@ -876,28 +868,11 @@ pub(crate) fn append_fill_circle(
     center: Point<Pixels>,
     r: Pixels,
 ) {
-    let k = r * 0.5523;
     builder.move_to(point(center.x + r, center.y));
-    builder.curve_to(
-        point(center.x, center.y + r),
-        point(center.x + r, center.y + k),
-    );
-    builder.curve_to(
-        point(center.x - r, center.y),
-        point(center.x - k, center.y + r),
-    );
-    builder.curve_to(
-        point(center.x, center.y - r),
-        point(center.x - r, center.y - k),
-    );
-    builder.curve_to(
-        point(center.x + r, center.y),
-        point(center.x + k, center.y - r),
-    );
+    append_arc(builder, center, r, 0.0, 360.0);
     builder.close();
 }
 
-/// Paints one commit node in jj's conventions: `○` normal (solid dot, the
 /// Paints one commit node in jj's conventions: `○` normal (solid dot, the
 /// approved v2 base, hollow ring), `◆` immutable (filled diamond), `@`
 /// working copy and
