@@ -876,7 +876,7 @@ pub(crate) const JJ_GLYPH_CLEARANCE: Pixels = px(6.5);
 /// the lane lines (the commit ring is 4.5px radius).
 const AT_SIGN_SIZE: Pixels = px(13.0);
 const WAVE_SIZE: Pixels = px(10.0);
-const CONFLICT_X_SIZE: Pixels = px(15.0);
+const CONFLICT_X_SIZE: Pixels = px(14.0);
 
 /// Node marks as monochrome SVGs, tinted with the node color at paint
 /// time. The `@` is Lucide's at-sign (ISC); the wave is hand-drawn to read

@@ -805,8 +805,10 @@ impl JjLog {
                     // so its halo matches the circles' — the wave's
                     // horizontal overhang may stick out.
                     let halo_radius = |glyph: JjNodeGlyph| match glyph {
-                        JjNodeGlyph::WorkingCopy => JJ_GLYPH_CLEARANCE + EDGE_BORDER_WIDTH,
-                        _ => JJ_NODE_RADIUS + EDGE_BORDER_WIDTH,
+                        JjNodeGlyph::WorkingCopy => {
+                            JJ_GLYPH_CLEARANCE + EDGE_BORDER_WIDTH + px(1.0)
+                        }
+                        _ => JJ_NODE_RADIUS + EDGE_BORDER_WIDTH + px(1.0),
                     };
                     for (row_idx, (row, flags)) in
                         rows.into_iter().zip(visible_flags.iter()).enumerate()
